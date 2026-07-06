@@ -5,7 +5,7 @@ use ikigai_core::{
     Capability, EndpointSpace, Exact, FnEndpoint, Iri, Kernel, ReprType, Representation, Request,
     Verb,
 };
-use ikigai_throttle::{Rate, Throttle};
+use ikigai_throttle::{Rate, RateLimit};
 use std::{sync::Arc, time::Duration};
 
 fn main() {
@@ -20,7 +20,7 @@ fn main() {
     );
     // A budget a well-behaved caller stays under, and a runaway blows through.
     let space =
-        Throttle::new(inner).limit("urn:system:exec", Rate::new(3, Duration::from_secs(10)));
+        RateLimit::new(inner).limit("urn:system:exec", Rate::new(3, Duration::from_secs(10)));
     let kernel = Kernel::new(Arc::new(space));
 
     println!("budget: 3 exec calls / 10s\n");
