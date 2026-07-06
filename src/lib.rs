@@ -28,8 +28,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ikigai_core::{
-    Description, Endpoint, Error, FnEndpoint, Representation, Request, Resolution, Resolved, Scope,
-    Space, SpaceEntry, Verb,
+    Description, Endpoint, Error, FnEndpoint, Request, Resolution, Resolved, Scope, Space,
+    SpaceEntry, Verb,
 };
 use std::sync::Arc;
 
@@ -73,7 +73,7 @@ impl<S: Space> Throttle<S> {
     pub fn limit(mut self, prefix: impl Into<String>, rate: Rate) -> Self {
         self.rules.push((prefix.into(), rate));
         // Longest prefix first, so `rule_for` takes the most specific match.
-        self.rules.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        self.rules.sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
         self
     }
 
