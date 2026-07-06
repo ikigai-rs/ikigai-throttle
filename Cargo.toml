@@ -1,0 +1,16 @@
+[package]
+name = "ikigai-throttle"
+description = "Rate-limiting as an interception overlay: a Space decorator that caps resolution velocity per URI prefix."
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Brian Sletten <brian.sletten@gmail.com>"]
+repository = "https://github.com/ikigai-rs/ikigai-throttle"
+
+[dependencies]
+# Native crate: it keeps a sliding window of Instants, so no wasm face (a wasm
+# throttle would inject a Clock — a later refinement). Wraps ANY Space.
+ikigai-core = "0.1.39"
+
+[dev-dependencies]
+futures = "0.3"
