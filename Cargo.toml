@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-throttle"
-description = "Rate-limiting as an interception overlay: a Space decorator that caps resolution velocity per URI prefix."
+description = "Flow-control interception overlays for ikigai: RateLimit (reject over a per-prefix rate) now; a concurrency Throttle later."
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"

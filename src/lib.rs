@@ -1,23 +1,29 @@
 //! Rate-limiting as an **interception overlay**.
 //!
-//! [`Throttle`] wraps *any* [`Space`] and caps how often resources under a URI
-//! prefix may resolve. When a prefix is over budget, the request resolves not to
-//! its real endpoint but to a **throttled endpoint** that returns an honest
-//! `throttled — retry after N` error on invoke. Everything else passes straight
-//! through, so a throttle composes in front of a leaf space, a `Fallback`, or
-//! another overlay with no change to what it wraps.
+//! [`RateLimit`] wraps *any* [`Space`] and caps how often resources under a URI
+//! prefix may resolve: at most N resolutions per time window. Over budget, the
+//! request resolves not to its real endpoint but to a **rate-limited endpoint**
+//! that returns an honest `rate-limited — retry after N` error on invoke.
+//! Everything else passes straight through, so it composes in front of a leaf
+//! space, a `Fallback`, or another overlay with no change to what it wraps.
+//!
+//! `RateLimit` REJECTS the excess — the right tool for external politeness
+//! (a published rate you must not exceed, e.g. a SPARQL endpoint or crates.io).
+//! Its sibling — a concurrency `Throttle` that PARKS the excess until a slot
+//! frees (backpressure, never an error), for local overload protection — is a
+//! later addition to this crate; both are the same Space-decorator shape.
 //!
 //! It is the first instance of ikigai's interception primitive: the same
-//! Space-decorator shape will carry logging, egress filtering, and
-//! load-balancing. The motivating use is a standing server (dev, dreamer, red
-//! team) where a runaway or buggy agent must not hammer `urn:system:exec` or a
-//! remote API through the substrate.
+//! Space-decorator shape will carry the concurrency throttle, logging, egress
+//! filtering, and load-balancing. The motivating use is a standing server (dev,
+//! dreamer, red team) where a runaway or buggy agent must not hammer
+//! `urn:system:exec` or a remote API through the substrate.
 //!
 //! ```
-//! use ikigai_throttle::{Throttle, Rate};
+//! use ikigai_throttle::{RateLimit, Rate};
 //! use std::time::Duration;
 //! # fn wrap(inner: ikigai_core::EndpointSpace) {
-//! let space = Throttle::new(inner)
+//! let space = RateLimit::new(inner)
 //!     .limit("urn:system:exec", Rate::new(3, Duration::from_secs(10)))
 //!     .limit("urn:httpGet", Rate::new(30, Duration::from_secs(60)));
 //! # let _ = space; }
@@ -51,17 +57,17 @@ impl Rate {
 
 /// A [`Space`] overlay that rate-limits resolutions by URI prefix. Wrap any
 /// space, then `limit` one or more prefixes. Longest-prefix wins; an unmatched
-/// target is never throttled.
-pub struct Throttle<S> {
+/// target is never limited.
+pub struct RateLimit<S> {
     inner: S,
     rules: Vec<(String, Rate)>,
     hits: Mutex<HashMap<String, VecDeque<Instant>>>,
 }
 
-impl<S: Space> Throttle<S> {
+impl<S: Space> RateLimit<S> {
     /// Wrap `inner`; add limits with [`limit`](Self::limit).
     pub fn new(inner: S) -> Self {
-        Throttle {
+        RateLimit {
             inner,
             rules: Vec::new(),
             hits: Mutex::new(HashMap::new()),
@@ -86,12 +92,12 @@ impl<S: Space> Throttle<S> {
     }
 }
 
-impl<S: Space> Space for Throttle<S> {
+impl<S: Space> Space for RateLimit<S> {
     fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
         let Resolution::Hit(hit) = self.inner.resolve(request, scope) else {
             return Resolution::Miss; // a miss is nothing to throttle
         };
-        // Never throttle self-description — describing a resource is cheap and an
+        // Never rate-limit self-description — describing a resource is cheap and an
         // agent must always be able to read what it may (or may not) invoke.
         if request.verb == Verb::Meta {
             return Resolution::Hit(hit);
@@ -115,7 +121,7 @@ impl<S: Space> Space for Throttle<S> {
                 .window
                 .saturating_sub(now.duration_since(*window.front().expect("non-empty")));
             return Resolution::Hit(Resolved {
-                endpoint: throttled(prefix, *rate, retry),
+                endpoint: rate_limited(prefix, *rate, retry),
                 bindings: hit.bindings,
             });
         }
@@ -132,20 +138,20 @@ impl<S: Space> Space for Throttle<S> {
 
 /// The endpoint an over-budget request resolves to: it errors on invoke with an
 /// honest, actionable message.
-fn throttled(prefix: &str, rate: Rate, retry: Duration) -> Arc<dyn Endpoint> {
+fn rate_limited(prefix: &str, rate: Rate, retry: Duration) -> Arc<dyn Endpoint> {
     let message = format!(
-        "throttled: `{prefix}` is capped at {}/{}s — retry after {}s",
+        "rate-limited: `{prefix}` is capped at {}/{}s — retry after {}s",
         rate.max,
         rate.window.as_secs().max(1),
         retry.as_secs() + 1
     );
     let summary = message.clone();
     Arc::new(
-        FnEndpoint::new("throttled", move |_inv| {
+        FnEndpoint::new("rate-limited", move |_inv| {
             Err(Error::Endpoint(message.clone()))
         })
         .with_description(
-            Description::new("throttled")
+            Description::new("rate-limited")
                 .title("Rate limit reached")
                 .summary(summary)
                 .verb(Verb::Source)
@@ -172,7 +178,7 @@ mod tests {
 
     fn kernel_with(rate: Rate) -> Kernel {
         let inner = EndpointSpace::new().bind(Exact::new("urn:demo:tick"), always_ok());
-        let space = Throttle::new(inner).limit("urn:demo:", rate);
+        let space = RateLimit::new(inner).limit("urn:demo:", rate);
         Kernel::new(Arc::new(space))
     }
 
@@ -191,7 +197,7 @@ mod tests {
             assert!(tick(&kernel).is_ok(), "call {i} should pass");
         }
         let err = tick(&kernel).unwrap_err();
-        assert!(format!("{err:?}").contains("throttled"), "{err:?}");
+        assert!(format!("{err:?}").contains("rate-limited"), "{err:?}");
         assert!(format!("{err:?}").contains("retry after"), "{err:?}");
     }
 
@@ -208,7 +214,7 @@ mod tests {
     fn unmatched_prefixes_and_meta_pass_freely() {
         let inner = EndpointSpace::new().bind(Exact::new("urn:other:x"), always_ok());
         let space =
-            Throttle::new(inner).limit("urn:demo:", Rate::new(1, Duration::from_secs(3600)));
+            RateLimit::new(inner).limit("urn:demo:", Rate::new(1, Duration::from_secs(3600)));
         let kernel = Kernel::new(Arc::new(space));
         // Not under the limited prefix → never throttled, however many times.
         for _ in 0..5 {
