@@ -73,7 +73,8 @@ impl<S: Space> Throttle<S> {
     pub fn limit(mut self, prefix: impl Into<String>, rate: Rate) -> Self {
         self.rules.push((prefix.into(), rate));
         // Longest prefix first, so `rule_for` takes the most specific match.
-        self.rules.sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
+        self.rules
+            .sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
         self
     }
 
