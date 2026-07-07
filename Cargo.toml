@@ -1,7 +1,7 @@
 [package]
 name = "ikigai-throttle"
-description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue transient idempotent failures), CircuitBreaker (trip open on a failing dependency), Failover (try [primary, backup, ...] on transient failure), Timeout (bound an invocation, transient on elapse); a concurrency Throttle later."
-version = "0.1.5"
+description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue transient idempotent failures), CircuitBreaker (trip open on a failing dependency), Failover (try [primary, backup, ...] on transient failure), Timeout (bound an invocation, transient on elapse), Throttle (cap concurrency, park the excess); logging & load-balancing later."
+version = "0.1.6"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -17,3 +17,5 @@ async-trait = "0.1"
 # timer (futures-timer works under the kernel's `block_on`, no tokio).
 futures = "0.3"
 futures-timer = "3"
+# Throttle parks the excess on a fair async Semaphore (runtime-agnostic).
+async-lock = "3"
