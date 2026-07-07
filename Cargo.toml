@@ -1,7 +1,7 @@
 [package]
 name = "ikigai-throttle"
-description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue transient idempotent failures), CircuitBreaker (trip open on a failing dependency), Failover (try [primary, backup, ...] on transient failure); a concurrency Throttle later."
-version = "0.1.3"
+description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue transient idempotent failures), CircuitBreaker (trip open on a failing dependency), Failover (try [primary, backup, ...] on transient failure), Timeout (bound an invocation, transient on elapse); a concurrency Throttle later."
+version = "0.1.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -13,6 +13,7 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 ikigai-core = "0.1.45" # Error::is_transient (Retry gates on it)
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
-
-[dev-dependencies]
+# Timeout races the invoke against a timer: `select` (futures) + a runtime-agnostic
+# timer (futures-timer works under the kernel's `block_on`, no tokio).
 futures = "0.3"
+futures-timer = "3"
