@@ -238,12 +238,194 @@ impl Endpoint for RetryEndpoint {
     }
 }
 
+/// Per-target circuit state for [`CircuitBreaker`].
+#[derive(Default)]
+struct Breaker {
+    /// Consecutive transient failures while closed.
+    failures: u32,
+    /// When the circuit tripped open, if it is open.
+    opened_at: Option<Instant>,
+}
+
+/// A [`Space`] overlay implementing Nygard's **Circuit Breaker** (from *Release
+/// It!*). It counts consecutive transient failures per target; after `threshold`
+/// it **trips open** and, for `cooldown`, fails fast — returning an
+/// [`Unavailable`](Error::Unavailable) error *without touching the dependency*, so
+/// a dead resource stops being hammered. Once `cooldown` elapses it goes
+/// **half-open**: the next call probes the dependency — success **closes** the
+/// circuit, another failure **re-opens** it. Only *transient* failures count;
+/// permanent ones (denied, not-found) pass through untouched. Sibling of
+/// [`RateLimit`] and [`Retry`]; its trip-open is the fast trigger a Failover reads.
+pub struct CircuitBreaker<S> {
+    inner: S,
+    threshold: u32,
+    cooldown: Duration,
+    states: Arc<Mutex<HashMap<String, Breaker>>>,
+}
+
+impl<S: Space> CircuitBreaker<S> {
+    /// Wrap `inner`; trip open after `threshold` consecutive transient failures,
+    /// staying open for `cooldown` before a half-open probe.
+    pub fn new(inner: S, threshold: u32, cooldown: Duration) -> Self {
+        CircuitBreaker {
+            inner,
+            threshold: threshold.max(1),
+            cooldown,
+            states: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<S: Space> Space for CircuitBreaker<S> {
+    fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
+        match self.inner.resolve(request, scope) {
+            Resolution::Hit(hit) => Resolution::Hit(Resolved {
+                endpoint: Arc::new(BreakerEndpoint {
+                    inner: hit.endpoint,
+                    target: request.target.as_str().to_string(),
+                    threshold: self.threshold,
+                    cooldown: self.cooldown,
+                    states: Arc::clone(&self.states),
+                }),
+                bindings: hit.bindings,
+            }),
+            Resolution::Miss => Resolution::Miss,
+        }
+    }
+
+    fn entries(&self) -> Option<Vec<SpaceEntry>> {
+        self.inner.entries()
+    }
+}
+
+/// The endpoint a [`CircuitBreaker`] resolves to: gate on the per-target circuit
+/// before invoking, and update it after.
+struct BreakerEndpoint {
+    inner: Arc<dyn Endpoint>,
+    target: String,
+    threshold: u32,
+    cooldown: Duration,
+    states: Arc<Mutex<HashMap<String, Breaker>>>,
+}
+
+#[async_trait::async_trait]
+impl Endpoint for BreakerEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+        // Gate: if open and still cooling, fail fast without touching the dependency.
+        {
+            let mut states = self.states.lock().expect("breaker lock");
+            let breaker = states.entry(self.target.clone()).or_default();
+            if let Some(opened) = breaker.opened_at {
+                if Instant::now().duration_since(opened) < self.cooldown {
+                    return Err(Error::Unavailable(format!(
+                        "circuit open for `{}` — failing fast until it cools down",
+                        self.target
+                    )));
+                }
+                // Cooldown elapsed → let this call through as a half-open probe.
+            }
+        }
+        // Invoke (closed, or a half-open probe), then update the circuit.
+        let outcome = self.inner.invoke(inv).await;
+        let mut states = self.states.lock().expect("breaker lock");
+        let breaker = states.entry(self.target.clone()).or_default();
+        match &outcome {
+            Ok(_) => {
+                // Success closes the circuit (and confirms a probe).
+                breaker.failures = 0;
+                breaker.opened_at = None;
+            }
+            Err(e) if e.is_transient() => {
+                breaker.failures += 1;
+                if breaker.failures >= self.threshold {
+                    breaker.opened_at = Some(Instant::now()); // trip, or re-open a failed probe
+                }
+            }
+            Err(_) => {} // permanent errors don't count toward tripping
+        }
+        outcome
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn describe(&self) -> Description {
+        self.inner.describe()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{Capability, EndpointSpace, Exact, Iri, Kernel, ReprType};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// An endpoint whose failure is toggleable, counting invocations — so a test
+    /// can watch the breaker stop reaching it, then let it recover.
+    struct Controlled {
+        fail: Arc<AtomicBool>,
+        seen: Arc<AtomicU32>,
+    }
+    #[async_trait::async_trait]
+    impl Endpoint for Controlled {
+        async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation, Error> {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                Err(Error::Unavailable("dependency down".into()))
+            } else {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"ok".to_vec(),
+                ))
+            }
+        }
+    }
+
+    #[test]
+    fn trips_open_fails_fast_then_recovers_after_cooldown() {
+        let seen = Arc::new(AtomicU32::new(0));
+        let fail = Arc::new(AtomicBool::new(true));
+        let endpoint = Arc::new(Controlled {
+            fail: fail.clone(),
+            seen: seen.clone(),
+        });
+        let space = EndpointSpace::new().bind_arc(Exact::new("urn:dep"), endpoint);
+        let kernel = Kernel::new(Arc::new(CircuitBreaker::new(
+            space,
+            2,
+            Duration::from_millis(20),
+        )));
+        let src = || Request::new(Verb::Source, Iri::parse("urn:dep").unwrap());
+
+        // Two transient failures trip the circuit — both reach the dependency.
+        assert!(block_on(kernel.issue(src(), &Capability::root())).is_err());
+        assert!(block_on(kernel.issue(src(), &Capability::root())).is_err());
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+
+        // Circuit OPEN → fail fast WITHOUT touching the dependency.
+        let err = block_on(kernel.issue(src(), &Capability::root())).unwrap_err();
+        assert!(format!("{err}").contains("circuit open"), "{err}");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "fast-failed, dependency untouched"
+        );
+
+        // Dependency recovers; after the cooldown, a half-open probe closes the circuit.
+        fail.store(false, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(block_on(kernel.issue(src(), &Capability::root())).is_ok());
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            3,
+            "the probe reached the recovered dependency"
+        );
+        // Closed again → traffic flows.
+        assert!(block_on(kernel.issue(src(), &Capability::root())).is_ok());
+        assert_eq!(seen.load(Ordering::SeqCst), 4);
+    }
 
     /// An endpoint that fails transiently (Timeout) its first `fail` invocations,
     /// then succeeds — counting invocations so a test can see how many ran.
