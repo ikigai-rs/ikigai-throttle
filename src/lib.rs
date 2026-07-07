@@ -355,6 +355,107 @@ impl Endpoint for BreakerEndpoint {
     }
 }
 
+/// A [`Space`] overlay that **fails over** across an ordered list of spaces
+/// `[primary, backup, …]`. It resolves the request against each, then on invoke
+/// tries them in order — advancing to the next only while the error
+/// [`is_transient`](Error::is_transient) **and** the verb is idempotent
+/// (Source/Exists/Meta/Delete), since failing a non-idempotent `Sink` over to
+/// another node could double-apply it. A permanent error stops immediately (a
+/// backup would answer the same). The DR ladder's core; wrap a primary in a
+/// [`CircuitBreaker`] and its trip-open becomes the *fast* trigger to move on.
+/// Sibling of [`Retry`] — Retry re-issues to the *same* target, Failover to the *next*.
+pub struct Failover {
+    spaces: Vec<Arc<dyn Space>>,
+}
+
+impl Failover {
+    /// Fail over across `spaces` in order — the first is the primary.
+    pub fn new(spaces: Vec<Arc<dyn Space>>) -> Self {
+        Failover { spaces }
+    }
+}
+
+impl Space for Failover {
+    fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
+        // Resolve against every target now (cheap — a remote space's resolve is a
+        // local ForwardingEndpoint, no round-trip); the wire calls happen on invoke,
+        // and only as far down the list as failures force.
+        let mut endpoints = Vec::new();
+        let mut bindings = None;
+        for space in &self.spaces {
+            if let Resolution::Hit(hit) = space.resolve(request, scope) {
+                if bindings.is_none() {
+                    bindings = Some(hit.bindings);
+                }
+                endpoints.push(hit.endpoint);
+            }
+        }
+        match bindings {
+            Some(bindings) => Resolution::Hit(Resolved {
+                endpoint: Arc::new(FailoverEndpoint { endpoints }),
+                bindings,
+            }),
+            None => Resolution::Miss,
+        }
+    }
+
+    fn entries(&self) -> Option<Vec<SpaceEntry>> {
+        let mut all = Vec::new();
+        let mut any = false;
+        for space in &self.spaces {
+            if let Some(entries) = space.entries() {
+                any = true;
+                all.extend(entries);
+            }
+        }
+        any.then_some(all)
+    }
+}
+
+/// The endpoint a [`Failover`] resolves to: try each target in order, advancing on
+/// a transient, idempotent failure.
+struct FailoverEndpoint {
+    endpoints: Vec<Arc<dyn Endpoint>>,
+}
+
+#[async_trait::async_trait]
+impl Endpoint for FailoverEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+        let idempotent = matches!(
+            inv.request.verb,
+            Verb::Source | Verb::Exists | Verb::Meta | Verb::Delete
+        );
+        let last = self.endpoints.len().saturating_sub(1);
+        let mut latest = None;
+        for (i, endpoint) in self.endpoints.iter().enumerate() {
+            match endpoint.invoke(inv).await {
+                Ok(representation) => return Ok(representation),
+                Err(e) if e.is_transient() && idempotent && i < last => {
+                    latest = Some(e); // this target is down — try the next
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(latest.unwrap_or_else(|| {
+            Error::Unavailable("no failover target resolved the request".into())
+        }))
+    }
+
+    fn name(&self) -> &str {
+        self.endpoints
+            .first()
+            .map(|e| e.name())
+            .unwrap_or("failover")
+    }
+
+    fn describe(&self) -> Description {
+        self.endpoints
+            .first()
+            .map(|e| e.describe())
+            .unwrap_or_else(|| Description::new("failover"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +597,50 @@ mod tests {
             seen.load(Ordering::SeqCst),
             1,
             "the Sink was invoked exactly once"
+        );
+    }
+
+    #[test]
+    fn fails_over_to_a_backup_but_never_for_a_sink() {
+        fn svc(fail: bool, seen: &Arc<AtomicU32>) -> Arc<dyn Space> {
+            Arc::new(EndpointSpace::new().bind_arc(
+                Exact::new("urn:svc"),
+                Arc::new(Controlled {
+                    fail: Arc::new(AtomicBool::new(fail)),
+                    seen: seen.clone(),
+                }),
+            ))
+        }
+        let primary = Arc::new(AtomicU32::new(0));
+        let backup = Arc::new(AtomicU32::new(0));
+        let req = |verb| Request::new(verb, Iri::parse("urn:svc").unwrap());
+
+        // (a) A Source fails over: the (down) primary is tried, the backup serves.
+        let kernel = Kernel::new(Arc::new(Failover::new(vec![
+            svc(true, &primary),
+            svc(false, &backup),
+        ])));
+        assert!(block_on(kernel.issue(req(Verb::Source), &Capability::root())).is_ok());
+        assert_eq!(primary.load(Ordering::SeqCst), 1, "primary tried first");
+        assert_eq!(
+            backup.load(Ordering::SeqCst),
+            1,
+            "backup served the failover"
+        );
+
+        // (b) A Sink never fails over — that could double-apply the write.
+        primary.store(0, Ordering::SeqCst);
+        backup.store(0, Ordering::SeqCst);
+        let kernel = Kernel::new(Arc::new(Failover::new(vec![
+            svc(true, &primary),
+            svc(false, &backup),
+        ])));
+        assert!(block_on(kernel.issue(req(Verb::Sink), &Capability::root())).is_err());
+        assert_eq!(primary.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backup.load(Ordering::SeqCst),
+            0,
+            "the backup is never touched by a Sink"
         );
     }
 

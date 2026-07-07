@@ -1,7 +1,7 @@
 [package]
 name = "ikigai-throttle"
-description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue transient idempotent failures), CircuitBreaker (Nygard: trip open on a failing dependency); a concurrency Throttle later."
-version = "0.1.2"
+description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue transient idempotent failures), CircuitBreaker (trip open on a failing dependency), Failover (try [primary, backup, ...] on transient failure); a concurrency Throttle later."
+version = "0.1.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
