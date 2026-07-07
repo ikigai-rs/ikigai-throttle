@@ -18,15 +18,16 @@
 //!   idempotent failure.
 //! - [`Timeout`] — bound an invocation; on elapse, drop the work and return a
 //!   transient timeout.
+//! - [`Throttle`] — cap *concurrency* per prefix and **park** the excess until a
+//!   slot frees (backpressure, never an error) — Nygard's Bulkhead.
 //!
-//! Every overlay reads the request **verb** (idempotency governs whether a
-//! re-issue is *safe*) and [`Error::is_transient`](ikigai_core::Error::is_transient)
-//! (whether it's *worth* retrying). A concurrency `Throttle` — cap concurrency and
-//! *park* the excess (backpressure, never an error) — plus logging, egress, and
-//! load-balancing overlays are later additions of the same shape. The motivating
-//! use is a standing server (a dev server, a background dreamer, a red-team agent)
-//! where a runaway or buggy agent must not hammer `urn:system:exec` or a remote
-//! API through the substrate.
+//! The reliability overlays read the request **verb** (idempotency governs whether
+//! a re-issue is *safe*) and [`Error::is_transient`](ikigai_core::Error::is_transient)
+//! (whether it's *worth* retrying). Logging, egress-filtering, and load-balancing
+//! overlays are later additions of the same shape. The motivating use is a standing
+//! server (a dev server, a background dreamer, a red-team agent) where a runaway or
+//! buggy agent must not hammer `urn:system:exec` or a remote API through the
+//! substrate.
 //!
 //! ```
 //! use ikigai_throttle::{RateLimit, Rate};
@@ -539,6 +540,100 @@ impl Endpoint for TimeoutEndpoint {
     }
 }
 
+/// A [`Space`] overlay that caps **concurrency** by URI prefix and **parks** the
+/// excess: at most N invocations of resources under a prefix run at once, and the
+/// N+1th *waits* for a slot to free rather than erroring. This is `RateLimit`'s
+/// sibling — RateLimit **rejects** to respect an external rate; `Throttle`
+/// **backpressures** to protect a local resource from overload (NetKernel's model:
+/// don't drop the work, hold it until there's room). Nygard's **Bulkhead**:
+/// isolate a hot prefix so it can't consume unbounded capacity. `Meta` and
+/// unmatched targets pass through unthrottled.
+pub struct Throttle<S> {
+    inner: S,
+    rules: Vec<(String, Arc<async_lock::Semaphore>)>,
+}
+
+impl<S: Space> Throttle<S> {
+    /// Wrap `inner`; add concurrency caps with [`limit`](Self::limit).
+    pub fn new(inner: S) -> Self {
+        Throttle {
+            inner,
+            rules: Vec::new(),
+        }
+    }
+
+    /// Allow at most `max` concurrent invocations of resources whose IRI starts
+    /// with `prefix`; the excess parks until a slot frees (builder).
+    pub fn limit(mut self, prefix: impl Into<String>, max: usize) -> Self {
+        self.rules.push((
+            prefix.into(),
+            Arc::new(async_lock::Semaphore::new(max.max(1))),
+        ));
+        // Longest prefix first, so `permit_for` takes the most specific match.
+        self.rules
+            .sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
+        self
+    }
+
+    /// The most specific rule's semaphore matching `target`, if any.
+    fn permit_for(&self, target: &str) -> Option<Arc<async_lock::Semaphore>> {
+        self.rules
+            .iter()
+            .find(|(prefix, _)| target.starts_with(prefix))
+            .map(|(_, sem)| Arc::clone(sem))
+    }
+}
+
+impl<S: Space> Space for Throttle<S> {
+    fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
+        let Resolution::Hit(hit) = self.inner.resolve(request, scope) else {
+            return Resolution::Miss;
+        };
+        // Never throttle self-description; only cap a matched prefix.
+        if request.verb == Verb::Meta {
+            return Resolution::Hit(hit);
+        }
+        match self.permit_for(request.target.as_str()) {
+            Some(semaphore) => Resolution::Hit(Resolved {
+                endpoint: Arc::new(ThrottleEndpoint {
+                    inner: hit.endpoint,
+                    semaphore,
+                }),
+                bindings: hit.bindings,
+            }),
+            None => Resolution::Hit(hit),
+        }
+    }
+
+    fn entries(&self) -> Option<Vec<SpaceEntry>> {
+        self.inner.entries()
+    }
+}
+
+/// The endpoint a [`Throttle`] resolves to: hold a permit for the invocation,
+/// parking until one is free.
+struct ThrottleEndpoint {
+    inner: Arc<dyn Endpoint>,
+    semaphore: Arc<async_lock::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl Endpoint for ThrottleEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+        // Park here until a slot frees; the guard releases it on drop, after invoke.
+        let _permit = self.semaphore.acquire_arc().await;
+        self.inner.invoke(inv).await
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn describe(&self) -> Description {
+        self.inner.describe()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,6 +859,53 @@ mod tests {
                 .issue(req(), &Capability::root()),
         );
         assert!(out.is_ok(), "fast work completes: {out:?}");
+    }
+
+    #[test]
+    fn throttle_caps_concurrency_and_parks_the_excess() {
+        use futures::future::join_all;
+        use std::sync::atomic::AtomicUsize;
+
+        // An endpoint that tracks how many invocations run simultaneously.
+        struct Concurrent {
+            live: Arc<AtomicUsize>,
+            max_seen: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl Endpoint for Concurrent {
+            async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation, Error> {
+                let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_seen.fetch_max(now, Ordering::SeqCst);
+                futures_timer::Delay::new(Duration::from_millis(30)).await; // hold the slot
+                self.live.fetch_sub(1, Ordering::SeqCst);
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"ok".to_vec(),
+                ))
+            }
+        }
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let endpoint = Arc::new(Concurrent {
+            live: live.clone(),
+            max_seen: max_seen.clone(),
+        });
+        let space = EndpointSpace::new().bind_arc(Exact::new("urn:work"), endpoint);
+        let kernel = Kernel::new(Arc::new(Throttle::new(space).limit("urn:work", 2)));
+        let req = || Request::new(Verb::Source, Iri::parse("urn:work").unwrap());
+        let cap = Capability::root();
+
+        // Fire five concurrently; at most two ever run together, but all complete
+        // (parked, never dropped).
+        let results = block_on(join_all((0..5).map(|_| kernel.issue(req(), &cap))));
+        assert!(results.iter().all(|r| r.is_ok()), "all five completed");
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= 2,
+            "never more than 2 ran at once, saw {}",
+            max_seen.load(Ordering::SeqCst)
+        );
+        assert_eq!(live.load(Ordering::SeqCst), 0, "every slot released");
     }
 
     fn always_ok() -> FnEndpoint {

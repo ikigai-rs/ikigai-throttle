@@ -22,6 +22,7 @@ composable everywhere.
 | **`CircuitBreaker`** | Count consecutive transient failures per target; **trip open** after a threshold and **fail fast** for a cooldown (without touching the dependency), then **half-open** and probe to recover. |
 | **`Failover`** | Try an ordered list `[primary, backup, …]`, advancing on a transient, idempotent failure. |
 | **`Timeout`** | Bound an invocation; if the budget elapses, drop the work and return a transient timeout. |
+| **`Throttle`** | Cap *concurrency* per prefix and **park** the excess until a slot frees (backpressure, never an error) — Nygard's Bulkhead. |
 
 Two things every overlay reads:
 
@@ -96,9 +97,8 @@ or a remote API through the substrate.
   inside an invoke never yields to the executor, so a single-threaded runtime
   can't fire the timer; that hang is fixed at the transport (a socket read
   timeout), complementary to this overlay.
-- Still to come: a concurrency **`Throttle`** (cap concurrency and *park* the
-  excess — backpressure, never an error), plus logging, egress-filtering, and
-  load-balancing overlays. Same shape, every one.
+- Still to come: logging, egress-filtering, and load-balancing overlays. Same
+  shape, every one.
 
 ## License
 
