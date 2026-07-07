@@ -1,23 +1,32 @@
-//! Rate-limiting as an **interception overlay**.
+//! **Reliability interception overlays** for ikigai.
 //!
-//! [`RateLimit`] wraps *any* [`Space`] and caps how often resources under a URI
-//! prefix may resolve: at most N resolutions per time window. Over budget, the
-//! request resolves not to its real endpoint but to a **rate-limited endpoint**
-//! that returns an honest `rate-limited — retry after N` error on invoke.
-//! Everything else passes straight through, so it composes in front of a leaf
-//! space, a `Fallback`, or another overlay with no change to what it wraps.
+//! An interception overlay is a [`Space`] that wraps another `Space`, adding
+//! cross-cutting behaviour to every resolution flowing through it without the
+//! wrapped space knowing — the substrate's composition primitive turned to
+//! reliability. Stack them in front of a leaf space, a `Fallback`, a remote
+//! mount, or one another. In effect these are Michael Nygard's *Release It!*
+//! stability patterns (Circuit Breaker, Timeouts, Bulkhead) as resolver
+//! decorators.
 //!
-//! `RateLimit` REJECTS the excess — the right tool for external politeness
-//! (a published rate you must not exceed, e.g. a SPARQL endpoint or crates.io).
-//! Its sibling — a concurrency `Throttle` that PARKS the excess until a slot
-//! frees (backpressure, never an error), for local overload protection — is a
-//! later addition to this crate; both are the same Space-decorator shape.
+//! - [`RateLimit`] — reject resolutions over a per-URI-prefix rate (external
+//!   politeness: a published rate you must not exceed).
+//! - [`Retry`] — re-issue on a *transient* failure, up to N times, for an
+//!   *idempotent* verb only (a `Sink` is never blindly re-sent).
+//! - [`CircuitBreaker`] — trip open after consecutive transient failures and fail
+//!   fast for a cooldown, then half-open and probe to recover.
+//! - [`Failover`] — try `[primary, backup, …]`, advancing on a transient,
+//!   idempotent failure.
+//! - [`Timeout`] — bound an invocation; on elapse, drop the work and return a
+//!   transient timeout.
 //!
-//! It is the first instance of ikigai's interception primitive: the same
-//! Space-decorator shape will carry the concurrency throttle, logging, egress
-//! filtering, and load-balancing. The motivating use is a standing server (dev,
-//! dreamer, red team) where a runaway or buggy agent must not hammer
-//! `urn:system:exec` or a remote API through the substrate.
+//! Every overlay reads the request **verb** (idempotency governs whether a
+//! re-issue is *safe*) and [`Error::is_transient`](ikigai_core::Error::is_transient)
+//! (whether it's *worth* retrying). A concurrency `Throttle` — cap concurrency and
+//! *park* the excess (backpressure, never an error) — plus logging, egress, and
+//! load-balancing overlays are later additions of the same shape. The motivating
+//! use is a standing server (a dev server, a background dreamer, a red-team agent)
+//! where a runaway or buggy agent must not hammer `urn:system:exec` or a remote
+//! API through the substrate.
 //!
 //! ```
 //! use ikigai_throttle::{RateLimit, Rate};
