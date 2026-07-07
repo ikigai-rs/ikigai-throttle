@@ -10,7 +10,9 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 [dependencies]
 # Native crate: it keeps a sliding window of Instants, so no wasm face (a wasm
 # throttle would inject a Clock — a later refinement). Wraps ANY Space.
-ikigai-core = "0.1.39"
+ikigai-core = "0.1.45" # Error::is_transient (Retry gates on it)
+# Retry's RetryEndpoint implements the async Endpoint trait directly.
+async-trait = "0.1"
 
 [dev-dependencies]
 futures = "0.3"

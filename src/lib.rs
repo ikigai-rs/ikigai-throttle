@@ -34,8 +34,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ikigai_core::{
-    Description, Endpoint, Error, FnEndpoint, Request, Resolution, Resolved, Scope, Space,
-    SpaceEntry, Verb,
+    Description, Endpoint, Error, FnEndpoint, Invocation, Representation, Request, Resolution,
+    Resolved, Scope, Space, SpaceEntry, Verb,
 };
 use std::sync::Arc;
 
@@ -161,11 +161,161 @@ fn rate_limited(prefix: &str, rate: Rate, retry: Duration) -> Arc<dyn Endpoint> 
     )
 }
 
+/// A [`Space`] overlay that **re-issues** a resolution on a transient failure. It
+/// wraps any space; a resolved endpoint is re-invoked up to `attempts` times while
+/// the error [`is_transient`](Error::is_transient) **and** the request verb is
+/// idempotent (Source/Exists/Meta/Delete). A non-idempotent `Sink` is never retried
+/// — a blind re-send could double-write; that needs an idempotency key. Permanent
+/// errors (denied, not-found, bad-argument) return immediately. Nygard's stability
+/// family; sibling of [`RateLimit`] (and of the coming CircuitBreaker/Failover).
+pub struct Retry<S> {
+    inner: S,
+    attempts: u32,
+}
+
+impl<S: Space> Retry<S> {
+    /// Wrap `inner`, allowing up to `attempts` total invocations of a resolved
+    /// endpoint (`1` = no retry).
+    pub fn new(inner: S, attempts: u32) -> Self {
+        Retry {
+            inner,
+            attempts: attempts.max(1),
+        }
+    }
+}
+
+impl<S: Space> Space for Retry<S> {
+    fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
+        match self.inner.resolve(request, scope) {
+            Resolution::Hit(hit) => Resolution::Hit(Resolved {
+                endpoint: Arc::new(RetryEndpoint {
+                    inner: hit.endpoint,
+                    attempts: self.attempts,
+                }),
+                bindings: hit.bindings,
+            }),
+            Resolution::Miss => Resolution::Miss,
+        }
+    }
+
+    fn entries(&self) -> Option<Vec<SpaceEntry>> {
+        self.inner.entries()
+    }
+}
+
+/// The endpoint a [`Retry`] resolves to: re-invoke the inner endpoint while the
+/// failure is transient and the verb idempotent.
+struct RetryEndpoint {
+    inner: Arc<dyn Endpoint>,
+    attempts: u32,
+}
+
+#[async_trait::async_trait]
+impl Endpoint for RetryEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+        let idempotent = matches!(
+            inv.request.verb,
+            Verb::Source | Verb::Exists | Verb::Meta | Verb::Delete
+        );
+        let mut attempt = 1;
+        loop {
+            match self.inner.invoke(inv).await {
+                Ok(representation) => return Ok(representation),
+                Err(e) if e.is_transient() && idempotent && attempt < self.attempts => {
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn describe(&self) -> Description {
+        self.inner.describe()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::executor::block_on;
-    use ikigai_core::{Capability, EndpointSpace, Exact, Iri, Kernel, ReprType, Representation};
+    use ikigai_core::{Capability, EndpointSpace, Exact, Iri, Kernel, ReprType};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// An endpoint that fails transiently (Timeout) its first `fail` invocations,
+    /// then succeeds — counting invocations so a test can see how many ran.
+    struct Flaky {
+        fail: u32,
+        seen: Arc<AtomicU32>,
+    }
+    #[async_trait::async_trait]
+    impl Endpoint for Flaky {
+        async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation, Error> {
+            let n = self.seen.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail {
+                Err(Error::Timeout(format!("attempt {n}")))
+            } else {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"ok".to_vec(),
+                ))
+            }
+        }
+    }
+
+    fn kernel_over(flaky: Arc<Flaky>, attempts: u32) -> Kernel {
+        let inner = EndpointSpace::new().bind_arc(Exact::new("urn:flaky"), flaky);
+        Kernel::new(Arc::new(Retry::new(inner, attempts)))
+    }
+
+    #[test]
+    fn retries_transient_idempotent_but_not_sinks_or_permanent() {
+        // (a) A Source that fails transiently twice then succeeds — retried to success.
+        let seen = Arc::new(AtomicU32::new(0));
+        let kernel = kernel_over(
+            Arc::new(Flaky {
+                fail: 2,
+                seen: seen.clone(),
+            }),
+            3,
+        );
+        let out = block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse("urn:flaky").unwrap()),
+            &Capability::root(),
+        ));
+        assert!(
+            out.is_ok(),
+            "transient failures retried to success: {out:?}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            3,
+            "2 transient fails + 1 success"
+        );
+
+        // (b) A non-idempotent Sink is never re-sent — one attempt, then the error.
+        let seen = Arc::new(AtomicU32::new(0));
+        let kernel = kernel_over(
+            Arc::new(Flaky {
+                fail: 2,
+                seen: seen.clone(),
+            }),
+            3,
+        );
+        let out = block_on(kernel.issue(
+            Request::new(Verb::Sink, Iri::parse("urn:flaky").unwrap()),
+            &Capability::root(),
+        ));
+        assert!(out.is_err(), "a Sink is not blindly re-sent");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the Sink was invoked exactly once"
+        );
+    }
 
     fn always_ok() -> FnEndpoint {
         FnEndpoint::new("ok", |_inv| {
