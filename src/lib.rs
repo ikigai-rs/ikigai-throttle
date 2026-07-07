@@ -456,6 +456,80 @@ impl Endpoint for FailoverEndpoint {
     }
 }
 
+/// A [`Space`] overlay that **bounds how long** an invocation may run. It races the
+/// inner endpoint's invoke against a timer; if the budget elapses first, the work
+/// is dropped and it returns a **transient** [`Timeout`](Error::Timeout) — so a
+/// [`Retry`]/[`Failover`] above can move on. Applies to every verb (a slow `Sink`
+/// is bounded too); the re-issue safety of a timed-out mutation is the verb's
+/// concern, not the timeout's. NOTE: this bounds genuinely *async* work — a purely
+/// synchronous blocking call inside the invoke (e.g. a blocking socket read) never
+/// yields, so a single-threaded executor can't fire the timer; that hang is fixed
+/// at the transport (a socket read timeout), complementary to this.
+pub struct Timeout<S> {
+    inner: S,
+    budget: Duration,
+}
+
+impl<S: Space> Timeout<S> {
+    /// Wrap `inner`, bounding each invocation to `budget`.
+    pub fn new(inner: S, budget: Duration) -> Self {
+        Timeout { inner, budget }
+    }
+}
+
+impl<S: Space> Space for Timeout<S> {
+    fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
+        match self.inner.resolve(request, scope) {
+            Resolution::Hit(hit) => Resolution::Hit(Resolved {
+                endpoint: Arc::new(TimeoutEndpoint {
+                    inner: hit.endpoint,
+                    target: request.target.as_str().to_string(),
+                    budget: self.budget,
+                }),
+                bindings: hit.bindings,
+            }),
+            Resolution::Miss => Resolution::Miss,
+        }
+    }
+
+    fn entries(&self) -> Option<Vec<SpaceEntry>> {
+        self.inner.entries()
+    }
+}
+
+/// The endpoint a [`Timeout`] resolves to: race the inner invoke against the budget.
+struct TimeoutEndpoint {
+    inner: Arc<dyn Endpoint>,
+    target: String,
+    budget: Duration,
+}
+
+#[async_trait::async_trait]
+impl Endpoint for TimeoutEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+        let work = self.inner.invoke(inv);
+        futures::pin_mut!(work);
+        match futures::future::select(work, futures_timer::Delay::new(self.budget)).await {
+            // The work finished within budget.
+            futures::future::Either::Left((result, _timer)) => result,
+            // The timer won — drop the in-flight work and report a transient timeout.
+            futures::future::Either::Right((_elapsed, _work)) => Err(Error::Timeout(format!(
+                "`{}` exceeded {}ms",
+                self.target,
+                self.budget.as_millis()
+            ))),
+        }
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn describe(&self) -> Description {
+        self.inner.describe()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +716,45 @@ mod tests {
             0,
             "the backup is never touched by a Sink"
         );
+    }
+
+    #[test]
+    fn times_out_slow_work_but_lets_fast_work_through() {
+        struct Slow {
+            delay: Duration,
+        }
+        #[async_trait::async_trait]
+        impl Endpoint for Slow {
+            async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation, Error> {
+                futures_timer::Delay::new(self.delay).await;
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"ok".to_vec(),
+                ))
+            }
+        }
+        let over = |delay, budget| {
+            let space =
+                EndpointSpace::new().bind_arc(Exact::new("urn:slow"), Arc::new(Slow { delay }));
+            Kernel::new(Arc::new(Timeout::new(space, budget)))
+        };
+        let req = || Request::new(Verb::Source, Iri::parse("urn:slow").unwrap());
+
+        // Work slower than the budget → a transient Timeout.
+        let err = block_on(
+            over(Duration::from_millis(60), Duration::from_millis(10))
+                .issue(req(), &Capability::root()),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("timeout"), "{err}");
+        assert!(err.is_transient(), "a timeout is transient");
+
+        // Work well within the budget → it completes normally.
+        let out = block_on(
+            over(Duration::from_millis(5), Duration::from_millis(200))
+                .issue(req(), &Capability::root()),
+        );
+        assert!(out.is_ok(), "fast work completes: {out:?}");
     }
 
     fn always_ok() -> FnEndpoint {
