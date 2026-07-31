@@ -459,9 +459,24 @@ impl Endpoint for FailoverEndpoint {
     }
 
     fn describe(&self) -> Description {
-        self.endpoints
-            .first()
+        // The first target that can actually DESCRIBE itself — not simply the
+        // first target.
+        //
+        // A description is how the engine routes named arguments, and a mount to
+        // an unreachable peer describes itself as a bare stub (its `describe` is a
+        // best-effort wire call, and a dead peer answers nothing). Taking that stub
+        // would strip every ArgSpec the resource really has, so `source urn:fn:toUpper
+        // in=hi` would lose `in=` and pass the literal text `in=hi` as content —
+        // failover that returns a WRONG answer instead of no answer. So skip targets
+        // that declare nothing and keep looking; if none declares anything, the first
+        // one's description is as good as any.
+        let described = self
+            .endpoints
+            .iter()
             .map(|e| e.describe())
+            .find(|d| !d.action_specs().is_empty());
+        described
+            .or_else(|| self.endpoints.first().map(|e| e.describe()))
             .unwrap_or_else(|| Description::new("failover"))
     }
 }
@@ -660,6 +675,48 @@ mod tests {
                 ))
             }
         }
+    }
+
+    /// A stand-in for a mount to an unreachable peer: it answers nothing and, like
+    /// a remote endpoint whose `describe` round-trip failed, declares nothing.
+    struct Unreachable;
+    #[async_trait::async_trait]
+    impl Endpoint for Unreachable {
+        async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation, Error> {
+            Err(Error::Unavailable("peer down".into()))
+        }
+        fn describe(&self) -> Description {
+            Description::new("remote")
+        }
+    }
+
+    /// The regression this guards: a `Failover` described itself with its FIRST
+    /// target's description, so a dead primary made the whole thing look
+    /// arg-less. The engine routes named arguments by that description, so
+    /// `source urn:x in=hi` lost `in=` and passed the literal `in=hi` as content —
+    /// a wrong answer, which is worse than no answer.
+    #[test]
+    fn a_failover_describes_itself_by_a_target_that_declares_something() {
+        struct Real;
+        #[async_trait::async_trait]
+        impl Endpoint for Real {
+            async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation, Error> {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"ok".to_vec(),
+                ))
+            }
+            fn describe(&self) -> Description {
+                Description::new("real").verb(Verb::Source)
+            }
+        }
+        let failover = FailoverEndpoint {
+            endpoints: vec![Arc::new(Unreachable), Arc::new(Real)],
+        };
+        assert!(
+            !failover.describe().action_specs().is_empty(),
+            "the live target's contract must survive a dead primary"
+        );
     }
 
     #[test]
