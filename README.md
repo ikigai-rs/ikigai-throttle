@@ -32,6 +32,33 @@ Two things every overlay reads:
 - **`Error::is_transient`** — timeouts and unavailability are worth retrying;
   a denial, a not-found, or a bad argument is permanent and returns immediately.
 
+## Transparent to identity
+
+An overlay decorates an endpoint; it does not become a different resource. So
+every one of these forwards what the resolution underneath reported — its
+bindings **and** its [`Resolved::canonical`], the name a rewriting space actually
+resolved under. That is what lets an `Alias` be composed *below* a governor:
+
+```rust
+// The `urn:store:` -> `urn:iki:store:` migration, rate-limited.
+let space = RateLimit::new(Alias::new(migration, backing))
+    .limit("urn:", Rate::new(100, Duration::from_secs(60)));
+```
+
+The kernel adopts the reported name before it derives the cache id, fires the
+golden-thread cut and evaluates the capability floor, so the logical and the
+backing name stay **one resource**: one cache entry, one thread — a `Sink`
+through either invalidates the other. An overlay that rebuilt the resolution
+instead of forwarding it would silently split them back into two names that
+merely agree until one is written; `tests/canonical.rs` holds every overlay in
+the family to it, and `just gates` will not let a seventh join without one.
+
+`Failover` is the exception that has to be stated: it keeps *all* its targets and
+defers the choice of which one answers to invoke — after the cache key is
+derived. It reports a canonical only when **every** target agrees on one (mirrors
+of a resource are that resource), and reports none when they disagree, rather
+than speaking for a target that may never serve.
+
 ## Composing them
 
 They nest, and the nesting *is* a resilience policy:

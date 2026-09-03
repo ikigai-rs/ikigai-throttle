@@ -1,7 +1,7 @@
 [package]
 name = "ikigai-throttle"
 description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue transient idempotent failures), CircuitBreaker (trip open on a failing dependency), Failover (try [primary, backup, ...] on transient failure), Timeout (bound an invocation, transient on elapse), Throttle (cap concurrency, park the excess); logging & load-balancing later."
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -10,7 +10,9 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 [dependencies]
 # Native crate: it keeps a sliding window of Instants, so no wasm face (a wasm
 # throttle would inject a Clock — a later refinement). Wraps ANY Space.
-ikigai-core = "0.1.45" # Error::is_transient (Retry gates on it)
+ikigai-core = "0.1.64" # Resolution::map_endpoint (an overlay must forward
+                      # what the inner resolution reported, not rebuild it);
+                      # Error::is_transient (Retry gates on it)
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
 # Timeout races the invoke against a timer: `select` (futures) + a runtime-agnostic
