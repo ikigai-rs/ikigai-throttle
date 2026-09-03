@@ -21,6 +21,14 @@
 //! - [`Throttle`] — cap *concurrency* per prefix and **park** the excess until a
 //!   slot frees (backpressure, never an error) — Nygard's Bulkhead.
 //!
+//! Every overlay here is **transparent to identity**: it decorates the endpoint
+//! and forwards everything the inner resolution reported — bindings and
+//! [`Resolved::canonical`](ikigai_core::Resolved::canonical), the name a rewriting
+//! space actually resolved under. So an [`Alias`](ikigai_core::Alias) composed
+//! *below* a governor still gives the logical and the backing name one cache entry
+//! and one golden thread. [`Failover`] is the stated exception — it reports a
+//! canonical only when every target agrees on one; see its `resolve`.
+//!
 //! The reliability overlays read the request **verb** (idempotency governs whether
 //! a re-issue is *safe*) and [`Error::is_transient`](ikigai_core::Error::is_transient)
 //! (whether it's *worth* retrying). Logging, egress-filtering, and load-balancing
@@ -130,10 +138,10 @@ impl<S: Space> Space for RateLimit<S> {
             let retry = rate
                 .window
                 .saturating_sub(now.duration_since(*window.front().expect("non-empty")));
-            return Resolution::Hit(Resolved {
-                endpoint: rate_limited(prefix, *rate, retry),
-                bindings: hit.bindings,
-            });
+            // Substitute the endpoint, keep everything else the inner resolution
+            // reported. Being over budget does not make this a different resource:
+            // if a rewrite underneath named it, that name still holds.
+            return Resolution::Hit(hit.with_endpoint(rate_limited(prefix, *rate, retry)));
         }
         window.push_back(now);
         Resolution::Hit(hit)
@@ -196,16 +204,10 @@ impl<S: Space> Retry<S> {
 
 impl<S: Space> Space for Retry<S> {
     fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
-        match self.inner.resolve(request, scope) {
-            Resolution::Hit(hit) => Resolution::Hit(Resolved {
-                endpoint: Arc::new(RetryEndpoint {
-                    inner: hit.endpoint,
-                    attempts: self.attempts,
-                }),
-                bindings: hit.bindings,
-            }),
-            Resolution::Miss => Resolution::Miss,
-        }
+        let attempts = self.attempts;
+        self.inner
+            .resolve(request, scope)
+            .map_endpoint(|inner| Arc::new(RetryEndpoint { inner, attempts }) as Arc<dyn Endpoint>)
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
@@ -288,19 +290,15 @@ impl<S: Space> CircuitBreaker<S> {
 
 impl<S: Space> Space for CircuitBreaker<S> {
     fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
-        match self.inner.resolve(request, scope) {
-            Resolution::Hit(hit) => Resolution::Hit(Resolved {
-                endpoint: Arc::new(BreakerEndpoint {
-                    inner: hit.endpoint,
-                    target: request.target.as_str().to_string(),
-                    threshold: self.threshold,
-                    cooldown: self.cooldown,
-                    states: Arc::clone(&self.states),
-                }),
-                bindings: hit.bindings,
-            }),
-            Resolution::Miss => Resolution::Miss,
-        }
+        self.inner.resolve(request, scope).map_endpoint(|inner| {
+            Arc::new(BreakerEndpoint {
+                inner,
+                target: request.target.as_str().to_string(),
+                threshold: self.threshold,
+                cooldown: self.cooldown,
+                states: Arc::clone(&self.states),
+            }) as Arc<dyn Endpoint>
+        })
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
@@ -390,23 +388,56 @@ impl Space for Failover {
         // Resolve against every target now (cheap — a remote space's resolve is a
         // local ForwardingEndpoint, no round-trip); the wire calls happen on invoke,
         // and only as far down the list as failures force.
-        let mut endpoints = Vec::new();
-        let mut bindings = None;
+        let mut hits: Vec<Resolved> = Vec::new();
         for space in &self.spaces {
             if let Resolution::Hit(hit) = space.resolve(request, scope) {
-                if bindings.is_none() {
-                    bindings = Some(hit.bindings);
-                }
-                endpoints.push(hit.endpoint);
+                hits.push(hit);
             }
         }
-        match bindings {
-            Some(bindings) => Resolution::Hit(Resolved {
-                endpoint: Arc::new(FailoverEndpoint { endpoints }),
-                bindings,
-            }),
-            None => Resolution::Miss,
+        let Some(first) = hits.first() else {
+            return Resolution::Miss;
+        };
+        let endpoints: Vec<Arc<dyn Endpoint>> =
+            hits.iter().map(|hit| Arc::clone(&hit.endpoint)).collect();
+
+        // ★ THE CANONICAL: report it only when every hit agrees, otherwise none.
+        //
+        // `Resolved::canonical` is the name a resolution actually resolved under
+        // when something underneath rewrote the target, and the kernel keys the
+        // cache entry, the golden-thread cut and the capability floor on it. Every
+        // other overlay in this crate has one inner resolution and simply forwards
+        // what it reported. Failover does not: it keeps ALL the hits and defers the
+        // choice of which one answers to invoke — after the cache key has already
+        // been derived. So "which canonical" has no answer here, and the three
+        // shapes are not equally safe:
+        //
+        // - The FIRST hit's, matching what `bindings` does below, is wrong in
+        //   exactly the case failover exists for. With `[alias→A, alias→B]` and A
+        //   down, the answer comes from B and is cached, invalidated and authorized
+        //   under A's name: a Sink to B leaves a stale read on the entry, and a
+        //   Sink to A cuts a thread nothing hangs off. That is a correctness bug
+        //   where reporting nothing is merely a missed optimization.
+        // - REFUSING to compose over disagreeing rewrites is loud but wrong for an
+        //   overlay whose entire job is tolerating difference between its targets —
+        //   and a `Space` cannot error anyway, so it would mean resolving to a
+        //   failing endpoint and turning a working failover into an outage.
+        // - CONSENSUS, taken here: when every hit reports the same thing, that name
+        //   is true whichever endpoint ends up serving — mirrors of one resource
+        //   are one resource, which is the shape failover is actually configured
+        //   for. When they disagree, `None` names nothing false: the names fall
+        //   back to a cache entry and a thread each, which is exactly the behaviour
+        //   before `canonical` existed. No hit is silently spoken for.
+        //
+        // `None` and `Some(_)` are a disagreement too, not a gap to fill in: a hit
+        // reporting nothing resolved under the request's own target, which is a
+        // different resource from one that rewrote.
+        let agreed = hits.iter().all(|hit| hit.canonical == first.canonical);
+        let mut resolved = hits.into_iter().next().expect("checked non-empty");
+        resolved.endpoint = Arc::new(FailoverEndpoint { endpoints });
+        if !agreed {
+            resolved.canonical = None;
         }
+        Resolution::Hit(resolved)
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
@@ -504,17 +535,13 @@ impl<S: Space> Timeout<S> {
 
 impl<S: Space> Space for Timeout<S> {
     fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
-        match self.inner.resolve(request, scope) {
-            Resolution::Hit(hit) => Resolution::Hit(Resolved {
-                endpoint: Arc::new(TimeoutEndpoint {
-                    inner: hit.endpoint,
-                    target: request.target.as_str().to_string(),
-                    budget: self.budget,
-                }),
-                bindings: hit.bindings,
-            }),
-            Resolution::Miss => Resolution::Miss,
-        }
+        self.inner.resolve(request, scope).map_endpoint(|inner| {
+            Arc::new(TimeoutEndpoint {
+                inner,
+                target: request.target.as_str().to_string(),
+                budget: self.budget,
+            }) as Arc<dyn Endpoint>
+        })
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
@@ -609,13 +636,13 @@ impl<S: Space> Space for Throttle<S> {
             return Resolution::Hit(hit);
         }
         match self.permit_for(request.target.as_str()) {
-            Some(semaphore) => Resolution::Hit(Resolved {
-                endpoint: Arc::new(ThrottleEndpoint {
-                    inner: hit.endpoint,
+            Some(semaphore) => {
+                let throttled = Arc::new(ThrottleEndpoint {
+                    inner: Arc::clone(&hit.endpoint),
                     semaphore,
-                }),
-                bindings: hit.bindings,
-            }),
+                });
+                Resolution::Hit(hit.with_endpoint(throttled))
+            }
             None => Resolution::Hit(hit),
         }
     }
