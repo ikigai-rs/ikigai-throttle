@@ -57,7 +57,10 @@ the family to it, and `just gates` will not let a seventh join without one.
 defers the choice of which one answers to invoke — after the cache key is
 derived. It reports a canonical only when **every** target agrees on one (mirrors
 of a resource are that resource), and reports none when they disagree, rather
-than speaking for a target that may never serve.
+than speaking for a target that may never serve. For the same reason each target
+is invoked on the variables **its own** grammar captured: candidates bound under
+different patterns (`urn:x/{id}` beside `urn:x/{name}`) each receive the
+arguments they declare, never the primary's.
 
 ## Composing them
 
