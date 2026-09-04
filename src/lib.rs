@@ -52,8 +52,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ikigai_core::{
-    Description, Endpoint, Error, FnEndpoint, Invocation, Representation, Request, Resolution,
-    Resolved, Scope, Space, SpaceEntry, Verb,
+    Bindings, Description, Endpoint, Error, FnEndpoint, Invocation, Representation, Request,
+    Resolution, Resolved, Scope, Space, SpaceEntry, Verb,
 };
 use std::sync::Arc;
 
@@ -135,9 +135,16 @@ impl<S: Space> Space for RateLimit<S> {
             window.pop_front();
         }
         if window.len() as u32 >= rate.max {
-            let retry = rate
-                .window
-                .saturating_sub(now.duration_since(*window.front().expect("non-empty")));
+            // The retry hint is how long until the OLDEST hit ages out — unless
+            // there is no oldest hit. `Rate::new(0, …)` reads as "never allowed",
+            // a plausible operator input, and it is over budget on an EMPTY
+            // window: unwrapping the front there panicked on the first resolve
+            // instead of refusing. A governor must refuse, never panic, so fall
+            // back to the whole window.
+            let retry = window
+                .front()
+                .map(|&t| rate.window.saturating_sub(now.duration_since(t)))
+                .unwrap_or(rate.window);
             // Substitute the endpoint, keep everything else the inner resolution
             // reported. Being over budget does not make this a different resource:
             // if a rewrite underneath named it, that name still holds.
@@ -372,6 +379,10 @@ impl Endpoint for BreakerEndpoint {
 /// backup would answer the same). The DR ladder's core; wrap a primary in a
 /// [`CircuitBreaker`] and its trip-open becomes the *fast* trigger to move on.
 /// Sibling of [`Retry`] — Retry re-issues to the *same* target, Failover to the *next*.
+///
+/// Each candidate is invoked on the variables **its own** grammar captured, so
+/// targets bound under different patterns (`urn:x/{id}` beside `urn:x/{name}`) are
+/// each handed the arguments they declare.
 pub struct Failover {
     spaces: Vec<Arc<dyn Space>>,
 }
@@ -397,8 +408,24 @@ impl Space for Failover {
         let Some(first) = hits.first() else {
             return Resolution::Miss;
         };
-        let endpoints: Vec<Arc<dyn Endpoint>> =
-            hits.iter().map(|hit| Arc::clone(&hit.endpoint)).collect();
+        // ★ EACH CANDIDATE KEEPS ITS OWN CAPTURES.
+        //
+        // The candidates are matched by their own grammars, which need not be the
+        // same grammar: `urn:x/{id}` beside `urn:x/{name}` both match `urn:x/7`,
+        // and each hit's `bindings` are the only ones ITS endpoint can read its
+        // arguments out of. Resolution ends here; invoke picks the answering
+        // candidate later, so this list is the last place the pairing still exists.
+        // Dropping it — keeping only the endpoints and invoking every one of them
+        // with the FIRST hit's bindings — made candidate 2 read `None` for its own
+        // variable and behave as it would for the bare target, silently and on the
+        // branch that looks like success.
+        let candidates: Vec<Candidate> = hits
+            .iter()
+            .map(|hit| Candidate {
+                endpoint: Arc::clone(&hit.endpoint),
+                bindings: hit.bindings.clone(),
+            })
+            .collect();
 
         // ★ THE CANONICAL: report it only when every hit agrees, otherwise none.
         //
@@ -433,7 +460,7 @@ impl Space for Failover {
         // different resource from one that rewrote.
         let agreed = hits.iter().all(|hit| hit.canonical == first.canonical);
         let mut resolved = hits.into_iter().next().expect("checked non-empty");
-        resolved.endpoint = Arc::new(FailoverEndpoint { endpoints });
+        resolved.endpoint = Arc::new(FailoverEndpoint { candidates });
         if !agreed {
             resolved.canonical = None;
         }
@@ -456,7 +483,16 @@ impl Space for Failover {
 /// The endpoint a [`Failover`] resolves to: try each target in order, advancing on
 /// a transient, idempotent failure.
 struct FailoverEndpoint {
-    endpoints: Vec<Arc<dyn Endpoint>>,
+    candidates: Vec<Candidate>,
+}
+
+/// One failover target: an endpoint and the variables **its own** grammar captured
+/// from the request. They travel together because the choice of which endpoint
+/// answers is deferred past resolution, and a capture is only meaningful to the
+/// grammar that took it.
+struct Candidate {
+    endpoint: Arc<dyn Endpoint>,
+    bindings: Bindings,
 }
 
 #[async_trait::async_trait]
@@ -466,10 +502,25 @@ impl Endpoint for FailoverEndpoint {
             inv.request.verb,
             Verb::Source | Verb::Exists | Verb::Meta | Verb::Delete
         );
-        let last = self.endpoints.len().saturating_sub(1);
+        let last = self.candidates.len().saturating_sub(1);
         let mut latest = None;
-        for (i, endpoint) in self.endpoints.iter().enumerate() {
-            match endpoint.invoke(inv).await {
+        for (i, candidate) in self.candidates.iter().enumerate() {
+            // Reborrow this invocation onto THIS candidate's captures. Two
+            // properties of `with_bindings` matter here and are easy to lose:
+            //
+            // - It cannot change `request`, and does not need to: every failover
+            //   candidate resolves the SAME target, and only the grammars that
+            //   matched it — hence the captures — differ. A combinator that needed
+            //   to invoke a *different* target would have to re-enter through
+            //   `issue`, and should; this is not the seam for that.
+            // - It SHARES the recording side (`deps`, `dep_threads`, `trace_notes`)
+            //   rather than copying it. That is what keeps a sub-request issued by
+            //   the answering candidate landing its expiry and its golden threads on
+            //   the parent invocation. Do not build the handle some other way —
+            //   `Invocation::detached` would compile here and would sever the
+            //   endpoint from the kernel, dropping the recording on the floor.
+            let attempt = inv.with_bindings(&candidate.bindings);
+            match candidate.endpoint.invoke(&attempt).await {
                 Ok(representation) => return Ok(representation),
                 Err(e) if e.is_transient() && idempotent && i < last => {
                     latest = Some(e); // this target is down — try the next
@@ -483,9 +534,9 @@ impl Endpoint for FailoverEndpoint {
     }
 
     fn name(&self) -> &str {
-        self.endpoints
+        self.candidates
             .first()
-            .map(|e| e.name())
+            .map(|c| c.endpoint.name())
             .unwrap_or("failover")
     }
 
@@ -502,12 +553,12 @@ impl Endpoint for FailoverEndpoint {
         // that declare nothing and keep looking; if none declares anything, the first
         // one's description is as good as any.
         let described = self
-            .endpoints
+            .candidates
             .iter()
-            .map(|e| e.describe())
+            .map(|c| c.endpoint.describe())
             .find(|d| !d.action_specs().is_empty());
         described
-            .or_else(|| self.endpoints.first().map(|e| e.describe()))
+            .or_else(|| self.candidates.first().map(|c| c.endpoint.describe()))
             .unwrap_or_else(|| Description::new("failover"))
     }
 }
@@ -680,7 +731,7 @@ impl Endpoint for ThrottleEndpoint {
 mod tests {
     use super::*;
     use futures::executor::block_on;
-    use ikigai_core::{Capability, EndpointSpace, Exact, Iri, Kernel, ReprType};
+    use ikigai_core::{Capability, EndpointSpace, Exact, Iri, Kernel, ReprType, UriTemplate};
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     /// An endpoint whose failure is toggleable, counting invocations — so a test
@@ -737,8 +788,12 @@ mod tests {
                 Description::new("real").verb(Verb::Source)
             }
         }
+        let candidate = |endpoint: Arc<dyn Endpoint>| Candidate {
+            endpoint,
+            bindings: Bindings::new(),
+        };
         let failover = FailoverEndpoint {
-            endpoints: vec![Arc::new(Unreachable), Arc::new(Real)],
+            candidates: vec![candidate(Arc::new(Unreachable)), candidate(Arc::new(Real))],
         };
         assert!(
             !failover.describe().action_specs().is_empty(),
@@ -859,6 +914,66 @@ mod tests {
             seen.load(Ordering::SeqCst),
             1,
             "the Sink was invoked exactly once"
+        );
+    }
+
+    /// The regression this guards: `Failover` kept the FIRST hit's bindings and
+    /// invoked EVERY candidate with them, so a candidate matched by a different
+    /// grammar read `None` for its own variable and behaved as it would for the
+    /// bare target — a wrong answer on the branch that looks like success.
+    ///
+    /// Two grammars over one target is the shape that exposes it: `urn:svc/{id}`
+    /// and `urn:svc/{name}` both match `urn:svc/seven`, and only the backup's own
+    /// captures contain `name`. The endpoint reports what it ACTUALLY saw, so the
+    /// assertion is about the invocation the candidate received, not about the
+    /// configuration it was built from.
+    #[test]
+    fn each_failover_candidate_reads_its_own_captures() {
+        /// Answers with the captures it was handed, both the variable its own
+        /// grammar declares and the one the *other* candidate's does.
+        struct Reporter;
+        #[async_trait::async_trait]
+        impl Endpoint for Reporter {
+            async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+                let name = inv.bindings.get("name").unwrap_or("<absent>");
+                let id = inv.bindings.get("id").unwrap_or("<absent>");
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    format!("name={name} id={id}").into_bytes(),
+                ))
+            }
+        }
+
+        let tried = Arc::new(AtomicU32::new(0));
+        // Candidate 1 matches `{id}` and is down; candidate 2 matches `{name}`.
+        let primary = Arc::new(EndpointSpace::new().bind_arc(
+            UriTemplate::parse("urn:svc/{id}").unwrap(),
+            Arc::new(Controlled {
+                fail: Arc::new(AtomicBool::new(true)),
+                seen: tried.clone(),
+            }),
+        )) as Arc<dyn Space>;
+        let backup = Arc::new(EndpointSpace::new().bind_arc(
+            UriTemplate::parse("urn:svc/{name}").unwrap(),
+            Arc::new(Reporter),
+        )) as Arc<dyn Space>;
+
+        let kernel = Kernel::new(Arc::new(Failover::new(vec![primary, backup])));
+        let repr = block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse("urn:svc/seven").unwrap()),
+            &Capability::root(),
+        ))
+        .expect("the backup serves the failover");
+
+        assert_eq!(
+            tried.load(Ordering::SeqCst),
+            1,
+            "the down primary was tried"
+        );
+        assert_eq!(
+            String::from_utf8(repr.bytes).unwrap(),
+            "name=seven id=<absent>",
+            "candidate 2 must read ITS OWN grammar's capture, not candidate 1's"
         );
     }
 
@@ -1024,6 +1139,31 @@ mod tests {
         let err = tick(&kernel).unwrap_err();
         assert!(format!("{err:?}").contains("rate-limited"), "{err:?}");
         assert!(format!("{err:?}").contains("retry after"), "{err:?}");
+    }
+
+    /// A governor must REFUSE, never panic. `Rate::new(0, …)` — "never allowed"
+    /// — is over budget with an empty window, so there is no oldest hit to
+    /// compute a retry hint from; unwrapping it panicked on the very first
+    /// resolve, taking the host down instead of denying the request.
+    #[test]
+    fn a_zero_rate_refuses_instead_of_panicking() {
+        let space = EndpointSpace::new().bind(
+            Exact::new("urn:never"),
+            FnEndpoint::new("never", |_inv| {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"ok".to_vec(),
+                ))
+            }),
+        );
+        let kernel = Kernel::new(Arc::new(
+            RateLimit::new(space).limit("urn:never", Rate::new(0, Duration::from_secs(60))),
+        ));
+        let out = block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse("urn:never").unwrap()),
+            &Capability::root(),
+        ));
+        assert!(out.is_err(), "a zero rate denies every resolution");
     }
 
     #[test]
