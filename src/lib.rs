@@ -135,9 +135,16 @@ impl<S: Space> Space for RateLimit<S> {
             window.pop_front();
         }
         if window.len() as u32 >= rate.max {
-            let retry = rate
-                .window
-                .saturating_sub(now.duration_since(*window.front().expect("non-empty")));
+            // The retry hint is how long until the OLDEST hit ages out — unless
+            // there is no oldest hit. `Rate::new(0, …)` reads as "never allowed",
+            // a plausible operator input, and it is over budget on an EMPTY
+            // window: unwrapping the front there panicked on the first resolve
+            // instead of refusing. A governor must refuse, never panic, so fall
+            // back to the whole window.
+            let retry = window
+                .front()
+                .map(|&t| rate.window.saturating_sub(now.duration_since(t)))
+                .unwrap_or(rate.window);
             // Substitute the endpoint, keep everything else the inner resolution
             // reported. Being over budget does not make this a different resource:
             // if a rewrite underneath named it, that name still holds.
@@ -1132,6 +1139,31 @@ mod tests {
         let err = tick(&kernel).unwrap_err();
         assert!(format!("{err:?}").contains("rate-limited"), "{err:?}");
         assert!(format!("{err:?}").contains("retry after"), "{err:?}");
+    }
+
+    /// A governor must REFUSE, never panic. `Rate::new(0, …)` — "never allowed"
+    /// — is over budget with an empty window, so there is no oldest hit to
+    /// compute a retry hint from; unwrapping it panicked on the very first
+    /// resolve, taking the host down instead of denying the request.
+    #[test]
+    fn a_zero_rate_refuses_instead_of_panicking() {
+        let space = EndpointSpace::new().bind(
+            Exact::new("urn:never"),
+            FnEndpoint::new("never", |_inv| {
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"ok".to_vec(),
+                ))
+            }),
+        );
+        let kernel = Kernel::new(Arc::new(
+            RateLimit::new(space).limit("urn:never", Rate::new(0, Duration::from_secs(60))),
+        ));
+        let out = block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse("urn:never").unwrap()),
+            &Capability::root(),
+        ));
+        assert!(out.is_err(), "a zero rate denies every resolution");
     }
 
     #[test]
