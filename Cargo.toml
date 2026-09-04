@@ -10,9 +10,11 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 [dependencies]
 # Native crate: it keeps a sliding window of Instants, so no wasm face (a wasm
 # throttle would inject a Clock — a later refinement). Wraps ANY Space.
-ikigai-core = "0.1.64" # Resolution::map_endpoint (an overlay must forward
+ikigai-core = "0.1.65" # Resolution::map_endpoint (an overlay must forward
                       # what the inner resolution reported, not rebuild it);
-                      # Error::is_transient (Retry gates on it)
+                      # Error::is_transient (Retry gates on it);
+                      # Invocation::with_bindings (each Failover candidate is
+                      # invoked on the captures ITS OWN grammar took)
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
 # Timeout races the invoke against a timer: `select` (futures) + a runtime-agnostic
