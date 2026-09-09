@@ -1,20 +1,10 @@
 name: ci
 on:
+  push: { branches: [main] }
   pull_request:
-  push:
-    branches: [main]
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # never cancel main
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: fmt
-        run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: test
-        run: cargo test
+  ci:
+    uses: ikigai-rs/.github/.github/workflows/rust.yml@main
