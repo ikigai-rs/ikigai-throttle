@@ -52,8 +52,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ikigai_core::{
-    Bindings, Description, Endpoint, Error, FnEndpoint, Invocation, Representation, Request,
-    Resolution, Resolved, Scope, Space, SpaceEntry, Verb,
+    Bindings, Description, Endpoint, Error, Invocation, Representation, Request, Resolution,
+    Resolved, Scope, Space, SpaceEntry, Verb,
 };
 use std::sync::Arc;
 
@@ -147,8 +147,11 @@ impl<S: Space> Space for RateLimit<S> {
                 .unwrap_or(rate.window);
             // Substitute the endpoint, keep everything else the inner resolution
             // reported. Being over budget does not make this a different resource:
-            // if a rewrite underneath named it, that name still holds.
-            return Resolution::Hit(hit.with_endpoint(rate_limited(prefix, *rate, retry)));
+            // if a rewrite underneath named it, that name still holds — and the
+            // substitute describes itself as the endpoint it stands in for, so the
+            // kernel's capability floor still holds too (see `RateLimited`).
+            let inner = Arc::clone(&hit.endpoint);
+            return Resolution::Hit(hit.with_endpoint(rate_limited(inner, prefix, *rate, retry)));
         }
         window.push_back(now);
         Resolution::Hit(hit)
@@ -163,27 +166,57 @@ impl<S: Space> Space for RateLimit<S> {
 
 /// The endpoint an over-budget request resolves to: it errors on invoke with an
 /// honest, actionable message.
-fn rate_limited(prefix: &str, rate: Rate, retry: Duration) -> Arc<dyn Endpoint> {
+fn rate_limited(
+    inner: Arc<dyn Endpoint>,
+    prefix: &str,
+    rate: Rate,
+    retry: Duration,
+) -> Arc<dyn Endpoint> {
     let message = format!(
         "rate-limited: `{prefix}` is capped at {}/{}s — retry after {}s",
         rate.max,
         rate.window.as_secs().max(1),
         retry.as_secs() + 1
     );
-    let summary = message.clone();
-    Arc::new(
-        FnEndpoint::new("rate-limited", move |_inv| {
-            Err(Error::Endpoint(message.clone()))
-        })
-        .with_description(
-            Description::new("rate-limited")
-                .title("Rate limit reached")
-                .summary(summary)
-                .verb(Verb::Source)
-                .verb(Verb::Meta)
-                .output("text/plain;charset=utf-8"),
-        ),
-    )
+    Arc::new(RateLimited { inner, message })
+}
+
+/// The over-budget stand-in for a wrapped endpoint. It refuses on invoke, and it
+/// **describes itself as the endpoint it stands in for**.
+///
+/// The kernel evaluates the declared-capability floor from the RESOLVED
+/// endpoint's `describe()`, after resolution and before the cache lookup and the
+/// invoke. This stand-in used to describe itself as `rate-limited`, declaring no
+/// `requires` — so once a prefix was over budget the wrapped endpoint's floor
+/// vanished with it: a caller holding no grant for a gated resource was told the
+/// prefix is rate-limited instead of `Denied`, learning something the floor
+/// exists to withhold, and the catalog's contract and the kernel's enforcement
+/// disagreed for the length of the window. `ikigai-conformance`'s ENFORCED check
+/// found it (`tests/conformance.rs`). Forwarding the description keeps declared =
+/// enforced whatever the budget says; the refusal itself is unchanged.
+///
+/// The refusal is a permanent [`Error::Endpoint`] carrying the retry hint: core
+/// has no typed "retry after" error, and a transient one would have a `Retry`
+/// above re-issue into the limit immediately, which is the opposite of the
+/// politeness the limit exists for.
+struct RateLimited {
+    inner: Arc<dyn Endpoint>,
+    message: String,
+}
+
+#[async_trait::async_trait]
+impl Endpoint for RateLimited {
+    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation, Error> {
+        Err(Error::Endpoint(self.message.clone()))
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn describe(&self) -> Description {
+        self.inner.describe()
+    }
 }
 
 /// A [`Space`] overlay that **re-issues** a resolution on a transient failure. It
@@ -731,7 +764,9 @@ impl Endpoint for ThrottleEndpoint {
 mod tests {
     use super::*;
     use futures::executor::block_on;
-    use ikigai_core::{Capability, EndpointSpace, Exact, Iri, Kernel, ReprType, UriTemplate};
+    use ikigai_core::{
+        Capability, EndpointSpace, Exact, FnEndpoint, Iri, Kernel, ReprType, UriTemplate,
+    };
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     /// An endpoint whose failure is toggleable, counting invocations — so a test

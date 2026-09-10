@@ -104,6 +104,16 @@ Longest-prefix wins; an unmatched target is never rate-limited; `Meta`
 may not invoke. The overlay is transparent to enumeration, so the catalog/manifold
 sees the wrapped bindings unchanged.
 
+Over budget, a resolution lands on a stand-in that refuses on invoke with a
+permanent `Error::Endpoint` carrying the retry hint (a transient error would have a
+`Retry` above re-issue straight into the limit). The stand-in **describes itself as
+the wrapped endpoint**, so the kernel's capability floor holds whatever the budget
+says: a caller with no grant for a gated resource is still `Denied`, and never
+learns the prefix is limited. Two consequences of the limit acting at resolution,
+which the kernel runs before its cache lookup: a representation already in the
+cache is served to an over-budget caller (the resource the limit protects is not
+touched), and a cache hit is charged against the window.
+
 `cargo run --example throttle-demo` watches a runaway loop hit the wall:
 
 ```
@@ -118,6 +128,22 @@ budget: 3 exec calls / 10s
 The motivating use is a standing server (a dev server, a background dreamer, a
 red-team agent) where a runaway or buggy agent must not hammer `urn:system:exec`
 or a remote API through the substrate.
+
+## Conformance
+
+Passes [`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance).
+This crate binds no endpoint of its own, so `tests/conformance.rs` walks a small
+conforming fixture space bare, through each overlay alone, and through the stack
+above, and requires every report to be clean with the same shape — then pins by
+hand what the walk cannot see: the catalog and every description through an
+overlay are the wrapped space's verbatim; a threaded read is cached under the
+wrapped endpoint's thread and cut by a `Sink` through the overlay, a live read stays
+live, a pure read caches with no thread; every typed `Error` an endpoint raises
+comes out of every overlay unchanged (`Retry` re-issues a transient one `attempts`
+times and returns the last); each overlay's own refusal is typed as its semantics
+say (open circuit: transient `Unavailable`; elapsed budget: transient `Timeout`;
+rate limit: permanent `Endpoint` with a retry hint) and none of them is ever
+cached.
 
 ## Notes
 
