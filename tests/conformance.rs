@@ -736,5 +736,19 @@ fn over_budget_the_only_findings_are_the_reads_a_refusal_cannot_serve() {
             "{finding}"
         );
     }
-    assert_eq!(report.findings.len(), 4, "{report}");
+    // OUTPUTS (conformance 0.1.1) reaches the Sink the cacheable probe skips, so the
+    // refusal is visible once more, on the one action with a mutating verb. Same cause,
+    // same shape: a read a refusal cannot serve.
+    let refused_outputs: Vec<&str> = report
+        .of(Check::Outputs)
+        .map(|f| f.endpoint.as_str())
+        .collect();
+    assert_eq!(refused_outputs, ["cell"], "{report}");
+    for finding in report.of(Check::Outputs) {
+        assert!(
+            finding.detail.contains("did not resolve") && finding.detail.contains("rate-limited"),
+            "{finding}"
+        );
+    }
+    assert_eq!(report.findings.len(), 5, "{report}");
 }

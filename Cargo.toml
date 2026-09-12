@@ -31,4 +31,4 @@ async-lock = "3"
 # holds each report to the bare fixture's: identical contract, identical
 # cacheability, the wrapped endpoint's typed errors unchanged. 0.1.0 pulls
 # ikigai-core 0.1.67, which the caret above admits.
-ikigai-conformance = "0.1.0"
+ikigai-conformance = "0.2.0"
