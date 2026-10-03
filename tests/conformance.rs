@@ -16,8 +16,10 @@
 //!   it. Declared `cacheable`.
 //! - `live` (`urn:live`) — a live read: uncacheable, and it answers a different
 //!   byte string every time so a cache hit would be visible.
-//! - `upper` (`urn:upper`) — a pure function of its one input: cacheable with an
-//!   empty thread set. Declared `pure` and `cacheable`.
+//! - `upper` (`urn:upper`) — a pure function of its one input: cacheable with no
+//!   thread but its own name (core 0.1.73 hangs every cacheable answer on the
+//!   thread of its own canonical target; before that the set was empty). Declared
+//!   `pure` and `cacheable`.
 //! - `gated` (`urn:gated`) — declares `urn:cap:demo:read`; the kernel's floor
 //!   enforces it (ENFORCED proves core's gate, not the module's — PENDING #46 —
 //!   and this module has no gate of its own to prove).
@@ -35,7 +37,8 @@
 //!   declaration is what makes an overlay that rebuilt the representation, or
 //!   resolved through something volatile, a red line rather than a silent
 //!   downgrade.
-//! - `pure("upper")`: its empty thread set is correct by construction.
+//! - `pure("upper")`: it reads nothing, so it carries no foreign thread by
+//!   construction.
 //! - No opt-outs, no namespace (no RDF face: the overlays keep no state a Turtle
 //!   face could serve), NAMES runs (every id is kebab-case).
 //!
@@ -50,7 +53,7 @@
 //!   ([`cacheability_is_inherited_not_manufactured`]): a threaded read is served
 //!   from the cache on the second resolution with the wrapped endpoint's thread,
 //!   a `Sink` through the overlay cuts it, a live read reaches the endpoint every
-//!   time, a pure read caches with no thread. The suite sees the second half of
+//!   time, a pure read caches with no thread but its own name. The suite sees the second half of
 //!   this (cache hit, non-empty threads) but not WHICH thread, and it cannot say
 //!   "live on purpose" (PENDING #22).
 //! - **Typed errors pass through unchanged**
@@ -461,13 +464,21 @@ fn cacheability_is_inherited_not_manufactured() {
             "{label}: a live read is never stored"
         );
 
-        // Pure: cached with no thread, byte-identical.
+        // Pure: cached with no thread but its own name, byte-identical. Since core
+        // 0.1.73 the kernel hangs every cacheable answer on its own canonical
+        // target's thread (ledger #512 hole A), so `is_empty()` is no longer what
+        // pure means; a FOREIGN thread is, and that stays refused.
         let a = source(&kernel, "urn:upper", &[("in", "hi")]).unwrap();
         let b = source(&kernel, "urn:upper", &[("in", "hi")]).unwrap();
         assert_eq!(a.bytes, b"HI");
         assert_eq!(a.bytes, b.bytes);
         assert_eq!(a.expiry, Expiry::Never, "{label}");
-        assert!(a.threads().is_empty(), "{label}: pure has no thread");
+        let own = Thread::new("urn:upper");
+        assert!(
+            a.threads().iter().all(|t| *t == own),
+            "{label}: pure carries only its own thread, got {:?}",
+            a.threads()
+        );
         assert!(
             kernel.is_cached(&request(Verb::Source, "urn:upper", &[("in", "hi")]), &root),
             "{label}"
