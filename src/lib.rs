@@ -29,6 +29,12 @@
 //! and one golden thread. [`Failover`] is the stated exception — it reports a
 //! canonical only when every target agrees on one; see its `resolve`.
 //!
+//! The same transparency holds for **structure**: an overlay that encloses one
+//! space reports that space's [`Space::topology`], [`Space::id`] and
+//! [`Space::entries`], so `urn:kernel:topology`, explain and the diagram see
+//! through a governor to the doors it guards. [`Failover`], enclosing several,
+//! is reported opaque; see its `topology`.
+//!
 //! The reliability overlays read the request **verb** (idempotency governs whether
 //! a re-issue is *safe*) and [`Error::is_transient`](ikigai_core::Error::is_transient)
 //! (whether it's *worth* retrying). Logging, egress-filtering, and load-balancing
@@ -52,8 +58,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ikigai_core::{
-    Bindings, Description, Endpoint, Error, Invocation, Representation, Request, Resolution,
-    Resolved, Scope, Space, SpaceEntry, Verb,
+    Bindings, Description, Endpoint, Error, Invocation, Iri, Representation, Request, Resolution,
+    Resolved, Scope, Space, SpaceEntry, Topology, Verb,
 };
 use std::sync::Arc;
 
@@ -162,6 +168,23 @@ impl<S: Space> Space for RateLimit<S> {
         // the wrapped bindings unchanged.
         self.inner.entries()
     }
+
+    // ★ And transparent to STRUCTURE and NAME (ledger #978), as every single-space
+    // overlay in this crate is. The default `topology` is an opaque node, which made
+    // a governed space invisible to `urn:kernel:topology`, explain, the diagram and a
+    // declared arrangement's harvest. Forwarding `id` is a claim that this overlay
+    // holds the same doors as the space it wraps (ledger #987), and it does: the same
+    // patterns, answered by the same endpoints, decorated. A decoration only ever
+    // adds a REFUSAL, and the kernel never caches a refusal, so a successful answer
+    // here is the bare space's answer and sharing its cache partition is sound.
+    // `tests/topology.rs` holds every overlay to it.
+    fn id(&self) -> Option<Iri> {
+        self.inner.id()
+    }
+
+    fn topology(&self) -> Topology {
+        self.inner.topology()
+    }
 }
 
 /// The endpoint an over-budget request resolves to: it errors on invoke with an
@@ -253,6 +276,14 @@ impl<S: Space> Space for Retry<S> {
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
         self.inner.entries()
     }
+
+    fn id(&self) -> Option<Iri> {
+        self.inner.id()
+    }
+
+    fn topology(&self) -> Topology {
+        self.inner.topology()
+    }
 }
 
 /// The endpoint a [`Retry`] resolves to: re-invoke the inner endpoint while the
@@ -343,6 +374,14 @@ impl<S: Space> Space for CircuitBreaker<S> {
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
         self.inner.entries()
+    }
+
+    fn id(&self) -> Option<Iri> {
+        self.inner.id()
+    }
+
+    fn topology(&self) -> Topology {
+        self.inner.topology()
     }
 }
 
@@ -511,6 +550,19 @@ impl Space for Failover {
         }
         any.then_some(all)
     }
+
+    /// Opaque, deliberately: the one overlay here that does not forward its
+    /// structure. It encloses SEVERAL spaces and picks the one that answers at
+    /// invoke time, and no core `SpaceKind` says that. `Fallback` is first hit at
+    /// RESOLUTION, so a failover reported as one would read back (a declaration, a
+    /// harvest) as an arrangement that never reaches the backup, a different
+    /// behavior presented as the same structure. Nor does it claim a name: its
+    /// targets differ by design, so no single claim over them is true. An opaque
+    /// node says where structural knowledge stops, which is the honest answer
+    /// until core has a kind for it.
+    fn topology(&self) -> Topology {
+        Topology::opaque(None)
+    }
 }
 
 /// The endpoint a [`Failover`] resolves to: try each target in order, advancing on
@@ -631,6 +683,14 @@ impl<S: Space> Space for Timeout<S> {
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
         self.inner.entries()
     }
+
+    fn id(&self) -> Option<Iri> {
+        self.inner.id()
+    }
+
+    fn topology(&self) -> Topology {
+        self.inner.topology()
+    }
 }
 
 /// The endpoint a [`Timeout`] resolves to: race the inner invoke against the budget.
@@ -733,6 +793,14 @@ impl<S: Space> Space for Throttle<S> {
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
         self.inner.entries()
+    }
+
+    fn id(&self) -> Option<Iri> {
+        self.inner.id()
+    }
+
+    fn topology(&self) -> Topology {
+        self.inner.topology()
     }
 }
 

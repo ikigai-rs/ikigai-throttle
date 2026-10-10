@@ -62,6 +62,26 @@ is invoked on the variables **its own** grammar captured: candidates bound under
 different patterns (`urn:x/{id}` beside `urn:x/{name}`) each receive the
 arguments they declare, never the primary's.
 
+## Transparent to structure
+
+The same holds for what a space says about itself. An overlay that encloses one
+space reports that space's `topology()`, `id()` and `entries()`, so
+`urn:kernel:topology`, explain, the diagram and a declared arrangement's harvest
+see through a governor to the doors it guards, and a host can put a `Timeout`
+around the one binding it means to bound instead of around its whole root. Stacks
+compose: `Retry(CircuitBreaker(Timeout(space)))` reports `space`.
+
+Forwarding the name is a claim (*any space with this name holds the same doors*),
+and it is true here: a governor holds exactly the doors it wraps, and what it adds
+is only ever a refusal (rate-limited, timed out, circuit open), which the kernel
+never caches. A successful answer through a governor is the bare space's answer.
+`tests/topology.rs` holds every overlay to it.
+
+`Failover` is again the exception, and reports an opaque node with no name: it
+encloses several spaces and chooses the answering one at invoke time, which no
+core space kind states. Calling it a `Fallback` (first hit at *resolution*) would
+read back as an arrangement that never reaches the backup.
+
 ## Composing them
 
 They nest, and the nesting *is* a resilience policy:
