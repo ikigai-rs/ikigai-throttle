@@ -31,6 +31,10 @@ async-lock = "3"
 # endpoint of its own — an overlay decorates whatever it wraps — so the suite
 # walks a conforming fixture space through every overlay and the whole stack and
 # holds each report to the bare fixture's: identical contract, identical
-# cacheability, the wrapped endpoint's typed errors unchanged. 0.1.0 pulls
-# ikigai-core 0.1.67, which the caret above admits.
-ikigai-conformance = "0.2.0"
+# cacheability, the wrapped endpoint's typed errors unchanged. 0.6.0 adds
+# SPACE-NAME (ledger #987): every overlay constructor is declared host-named, since
+# an overlay wraps a space it was handed and claims no name of its own.
+# ⚠ `"0.6.0"` is `>=0.6.0, <0.7.0` under Cargo's 0.x rules: raise it when 0.7 ships.
+# 0.6.0 pulls ikigai-core 0.1.89 into every test build; `[dependencies]` above
+# deliberately stays at the LIBRARY's true minimum (0.1.78), which the caret admits.
+ikigai-conformance = "0.6.0"

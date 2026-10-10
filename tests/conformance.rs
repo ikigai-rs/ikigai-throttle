@@ -13,7 +13,9 @@
 //!
 //! - `cell` (`urn:cell`) — a threaded read: `Source` is `.cacheable()` under the
 //!   golden thread named after the resource, `Sink` replaces the value and cuts
-//!   it. Declared `cacheable`.
+//!   it. Declared `cacheable`. The `Sink` requires `urn:cap:demo:write`
+//!   (conformance 0.3's AUTHORITY: a write anyone who can reach the endpoint may
+//!   make cannot be withheld from a reader).
 //! - `live` (`urn:live`) — a live read: uncacheable, and it answers a different
 //!   byte string every time so a cache hit would be visible.
 //! - `upper` (`urn:upper`) — a pure function of its one input: cacheable with no
@@ -41,6 +43,14 @@
 //!   construction.
 //! - No opt-outs, no namespace (no RDF face: the overlays keep no state a Turtle
 //!   face could serve), NAMES runs (every id is kebab-case).
+//! - `host_named_space` for every overlay constructor (conformance 0.6's
+//!   SPACE-NAME, ledger #987). This crate has no configuration-free `space()`:
+//!   every constructor takes the space it wraps, so only the host knows which
+//!   instance it built, and none of them names itself. What an overlay DOES do is
+//!   forward the `id()` of the space it encloses (ledger #978, `tests/topology.rs`):
+//!   over the anonymous fixture here that is no name, which is what host-named
+//!   asserts. Over a named space it is the wrapped space's own claim, carried
+//!   through, never one this crate makes.
 //!
 //! ## What the suite cannot hold, pinned by hand
 //!
@@ -87,11 +97,13 @@
 //!   charged against the window. Pinned as what the code does; a `Space` sees no
 //!   cache and no capability, so this is the kernel's ordering, reported up.
 //! - **`Failover` over mirrors doubles the catalog** (in [`conforms`]): its
-//!   `entries()` concatenates every target's, so two mirrors of one space are
-//!   walked twice — 4 endpoints, 10 actions. Every action is fired twice.
+//!   `entries()` concatenates every target's, so two mirrors of one space list 8
+//!   entries. Since conformance 0.4 the walk fires once per REQUEST, so each of
+//!   the 5 actions is fired once and the duplicate binding is reported as
+//!   collapsed (under 0.2 it was walked twice: 10 actions, every one fired twice).
 
 use futures::executor::block_on;
-use ikigai_conformance::{Check, Report, Suite};
+use ikigai_conformance::{Check, Report, SpaceNaming, Suite};
 use ikigai_core::{
     ActionSpec, ArgRef, ArgSpec, Capability, Description, Endpoint, EndpointSpace, Error, Exact,
     Expiry, FnEndpoint, Invocation, Iri, Kernel, ReprType, Representation, Request, Space, Thread,
@@ -104,6 +116,7 @@ use std::time::Duration;
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const READ_CAP: &str = "urn:cap:demo:read";
+const WRITE_CAP: &str = "urn:cap:demo:write";
 const TEXT: &str = "text/plain;charset=utf-8";
 
 /// The four fixture endpoints: id, bound IRI, verbs.
@@ -166,6 +179,7 @@ impl Leaf {
                     .action(
                         ActionSpec::new(Verb::Sink)
                             .input(ArgSpec::new("content").class(XSD_STRING))
+                            .requires(WRITE_CAP)
                             .output(TEXT),
                     ),
             )
@@ -304,8 +318,25 @@ fn suite() -> Suite {
         .pure("upper")
 }
 
+/// How the SPACE-NAME declaration names each composition: the call, as the
+/// conformance README asks, so a finding says which constructor it is about.
+fn constructor(label: &str) -> &'static str {
+    match label {
+        "RateLimit" => "ikigai_throttle::RateLimit::new(space).limit(..)",
+        "Retry" => "ikigai_throttle::Retry::new(space, attempts)",
+        "CircuitBreaker" => "ikigai_throttle::CircuitBreaker::new(space, threshold, cooldown)",
+        "Failover" => "ikigai_throttle::Failover::new(spaces)",
+        "Timeout" => "ikigai_throttle::Timeout::new(space, budget)",
+        "Throttle" => "ikigai_throttle::Throttle::new(space).limit(..)",
+        "stack" => {
+            "the README stack: Throttle(RateLimit(Failover(CircuitBreaker(Retry(Timeout)))))"
+        }
+        other => panic!("no constructor label for {other}"),
+    }
+}
+
 /// Four endpoints, five actions, nothing skipped, nothing opted out, the three
-/// declarations recorded.
+/// declarations recorded, and the one space declared host-named.
 fn assert_shape(label: &str, report: &Report, actions: usize) {
     assert_eq!(report.endpoints, LEAVES.len(), "{label}: {report}");
     assert_eq!(report.actions, actions, "{label}: {report}");
@@ -317,6 +348,17 @@ fn assert_shape(label: &str, report: &Report, actions: usize) {
     assert!(report.declared.opted_out.is_empty(), "{label}: {report}");
     assert_eq!(report.declared.cacheable, ["cell", "upper"], "{label}");
     assert_eq!(report.declared.pure, ["upper"], "{label}");
+    let spaces: Vec<(&str, SpaceNaming)> = report
+        .declared
+        .spaces
+        .iter()
+        .map(|space| (space.label.as_str(), space.naming))
+        .collect();
+    assert_eq!(
+        spaces,
+        [(constructor(label), SpaceNaming::HostNamed)],
+        "{label}: {report}"
+    );
 }
 
 fn request(verb: Verb, iri: &str, args: &[(&str, &str)]) -> Request {
@@ -350,27 +392,47 @@ fn none() -> Capability {
 /// lists every entry twice.
 #[test]
 fn conforms() {
+    // The bare fixture is not one of this crate's constructors, so it declares no
+    // space: the report says SPACE-NAME checked none.
     let bare = Kernel::new(Leaf::new().space());
     let report = suite().run_blocking(&bare);
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("bare: {report}");
-    assert!(report.is_clean(), "bare: {report}");
-    assert_shape("bare", &report, 5);
+    report.assert_clean();
+    assert_eq!(report.endpoints, LEAVES.len(), "bare: {report}");
+    assert_eq!(report.actions, 5, "bare: {report}");
+    assert!(report.declared.spaces.is_empty(), "bare: {report}");
 
     for (label, compose, _) in overlays() {
-        let kernel = Kernel::new(compose(Leaf::new().space()));
-        let report = suite().run_blocking(&kernel);
+        let space = compose(Leaf::new().space());
+        let kernel = Kernel::new(Arc::clone(&space));
+        let report = suite()
+            .host_named_space(constructor(label), space)
+            .run_blocking(&kernel);
         eprintln!("{label}: {report}");
-        assert!(report.is_clean(), "{label}: {report}");
+        report.assert_clean();
         assert_shape(label, &report, 5);
     }
 
     let leaf = Leaf::new();
-    let mirrored = Kernel::new(Arc::new(Failover::new(vec![leaf.space(), leaf.space()])));
-    let report = suite().run_blocking(&mirrored);
+    let mirrored: Arc<dyn Space> = Arc::new(Failover::new(vec![leaf.space(), leaf.space()]));
+    assert_eq!(
+        mirrored.entries().expect("enumerable").len(),
+        2 * LEAVES.len(),
+        "both mirrors listed"
+    );
+    let kernel = Kernel::new(Arc::clone(&mirrored));
+    let report = suite()
+        .host_named_space(constructor("Failover"), mirrored)
+        .run_blocking(&kernel);
     eprintln!("Failover over mirrors: {report}");
-    assert!(report.is_clean(), "mirrors: {report}");
-    assert_shape("mirrors", &report, 10);
+    report.assert_clean();
+    assert_shape("Failover", &report, 5);
+    assert_eq!(
+        report.collapsed.len(),
+        5,
+        "each action's second binding is collapsed onto the first: {report}"
+    );
 }
 
 /// The catalog and every description through an overlay are the bare space's,
