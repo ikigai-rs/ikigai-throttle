@@ -29,6 +29,11 @@
 //! and one golden thread. [`Failover`] is the stated exception — it reports a
 //! canonical only when every target agrees on one; see its `resolve`.
 //!
+//! Each governor also keeps **one wrapper per inner endpoint**, so a governed
+//! resource resolves to the same endpoint `Arc` every time and the kernel's
+//! per-endpoint floor memo hits (ledger #534); see the private `memo` module for
+//! why a reused wrapper is always the right one and why the table cannot leak.
+//!
 //! The same transparency holds for **structure**: an overlay that encloses one
 //! space reports that space's [`Space::topology`], [`Space::id`] and
 //! [`Space::entries`], so `urn:kernel:topology`, explain and the diagram see
@@ -56,6 +61,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+mod memo;
+use memo::{address, digest, Encloses, Wrappers};
 
 use ikigai_core::{
     Bindings, Description, Endpoint, Error, Invocation, Iri, Representation, Request, Resolution,
@@ -85,7 +93,11 @@ impl Rate {
 pub struct RateLimit<S> {
     inner: S,
     rules: Vec<(String, Rate)>,
-    hits: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// Shared with every over-budget stand-in, which reads its retry hint here
+    /// when it refuses rather than carrying one fixed when it was built.
+    hits: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+    /// One stand-in per (wrapped endpoint, limited prefix): see [`memo`].
+    stand_ins: Wrappers<(usize, String), RateLimited>,
 }
 
 impl<S: Space> RateLimit<S> {
@@ -94,7 +106,8 @@ impl<S: Space> RateLimit<S> {
         RateLimit {
             inner,
             rules: Vec::new(),
-            hits: Mutex::new(HashMap::new()),
+            hits: Arc::new(Mutex::new(HashMap::new())),
+            stand_ins: Wrappers::new(),
         }
     }
 
@@ -141,23 +154,26 @@ impl<S: Space> Space for RateLimit<S> {
             window.pop_front();
         }
         if window.len() as u32 >= rate.max {
-            // The retry hint is how long until the OLDEST hit ages out — unless
-            // there is no oldest hit. `Rate::new(0, …)` reads as "never allowed",
-            // a plausible operator input, and it is over budget on an EMPTY
-            // window: unwrapping the front there panicked on the first resolve
-            // instead of refusing. A governor must refuse, never panic, so fall
-            // back to the whole window.
-            let retry = window
-                .front()
-                .map(|&t| rate.window.saturating_sub(now.duration_since(t)))
-                .unwrap_or(rate.window);
+            drop(hits);
             // Substitute the endpoint, keep everything else the inner resolution
             // reported. Being over budget does not make this a different resource:
             // if a rewrite underneath named it, that name still holds — and the
             // substitute describes itself as the endpoint it stands in for, so the
-            // kernel's capability floor still holds too (see `RateLimited`).
-            let inner = Arc::clone(&hit.endpoint);
-            return Resolution::Hit(hit.with_endpoint(rate_limited(inner, prefix, *rate, retry)));
+            // kernel's capability floor still holds too (see `RateLimited`). The
+            // substitute is the SAME one every time for this endpoint and prefix,
+            // so a refused resource keeps one identity (ledger #534).
+            let inner = &hit.endpoint;
+            let stand_in = self.stand_ins.get_or_wrap(
+                (address(inner), prefix.clone()),
+                |_| true,
+                || RateLimited {
+                    inner: Arc::clone(inner),
+                    prefix: prefix.clone(),
+                    rate: *rate,
+                    hits: Arc::clone(&self.hits),
+                },
+            );
+            return Resolution::Hit(hit.with_endpoint(stand_in));
         }
         window.push_back(now);
         Resolution::Hit(hit)
@@ -187,23 +203,6 @@ impl<S: Space> Space for RateLimit<S> {
     }
 }
 
-/// The endpoint an over-budget request resolves to: it errors on invoke with an
-/// honest, actionable message.
-fn rate_limited(
-    inner: Arc<dyn Endpoint>,
-    prefix: &str,
-    rate: Rate,
-    retry: Duration,
-) -> Arc<dyn Endpoint> {
-    let message = format!(
-        "rate-limited: `{prefix}` is capped at {}/{}s — retry after {}s",
-        rate.max,
-        rate.window.as_secs().max(1),
-        retry.as_secs() + 1
-    );
-    Arc::new(RateLimited { inner, message })
-}
-
 /// The over-budget stand-in for a wrapped endpoint. It refuses on invoke, and it
 /// **describes itself as the endpoint it stands in for**.
 ///
@@ -221,16 +220,48 @@ fn rate_limited(
 /// The refusal is a permanent [`Error::Endpoint`] carrying the retry hint: core
 /// has no typed "retry after" error, and a transient one would have a `Retry`
 /// above re-issue into the limit immediately, which is the opposite of the
-/// politeness the limit exists for.
+/// politeness the limit exists for. The hint is computed when the stand-in
+/// refuses, from the window as it is then, because one stand-in serves every
+/// over-budget resolution of its endpoint (ledger #534).
 struct RateLimited {
     inner: Arc<dyn Endpoint>,
-    message: String,
+    prefix: String,
+    rate: Rate,
+    hits: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+}
+
+impl RateLimited {
+    /// How long until the OLDEST hit in the window ages out — unless there is no
+    /// oldest hit. `Rate::new(0, …)` reads as "never allowed", a plausible
+    /// operator input, and it is over budget on an EMPTY window: unwrapping the
+    /// front there panicked on the first resolve instead of refusing. A governor
+    /// must refuse, never panic, so fall back to the whole window.
+    fn retry_after(&self) -> Duration {
+        let now = Instant::now();
+        let hits = self.hits.lock().expect("throttle lock");
+        hits.get(&self.prefix)
+            .and_then(|window| window.front())
+            .map(|&t| self.rate.window.saturating_sub(now.duration_since(t)))
+            .unwrap_or(self.rate.window)
+    }
+}
+
+impl Encloses for RateLimited {
+    fn enclosed(&self) -> Vec<&Arc<dyn Endpoint>> {
+        vec![&self.inner]
+    }
 }
 
 #[async_trait::async_trait]
 impl Endpoint for RateLimited {
     async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation, Error> {
-        Err(Error::Endpoint(self.message.clone()))
+        Err(Error::Endpoint(format!(
+            "rate-limited: `{}` is capped at {}/{}s — retry after {}s",
+            self.prefix,
+            self.rate.max,
+            self.rate.window.as_secs().max(1),
+            self.retry_after().as_secs() + 1
+        )))
     }
 
     fn name(&self) -> &str {
@@ -252,6 +283,8 @@ impl Endpoint for RateLimited {
 pub struct Retry<S> {
     inner: S,
     attempts: u32,
+    /// One wrapper per inner endpoint: see [`memo`].
+    wrappers: Wrappers<usize, RetryEndpoint>,
 }
 
 impl<S: Space> Retry<S> {
@@ -261,6 +294,7 @@ impl<S: Space> Retry<S> {
         Retry {
             inner,
             attempts: attempts.max(1),
+            wrappers: Wrappers::new(),
         }
     }
 }
@@ -268,9 +302,13 @@ impl<S: Space> Retry<S> {
 impl<S: Space> Space for Retry<S> {
     fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
         let attempts = self.attempts;
-        self.inner
-            .resolve(request, scope)
-            .map_endpoint(|inner| Arc::new(RetryEndpoint { inner, attempts }) as Arc<dyn Endpoint>)
+        self.inner.resolve(request, scope).map_endpoint(|inner| {
+            self.wrappers.get_or_wrap(
+                address(&inner),
+                |_| true,
+                || RetryEndpoint { inner, attempts },
+            ) as Arc<dyn Endpoint>
+        })
     }
 
     fn entries(&self) -> Option<Vec<SpaceEntry>> {
@@ -291,6 +329,12 @@ impl<S: Space> Space for Retry<S> {
 struct RetryEndpoint {
     inner: Arc<dyn Endpoint>,
     attempts: u32,
+}
+
+impl Encloses for RetryEndpoint {
+    fn enclosed(&self) -> Vec<&Arc<dyn Endpoint>> {
+        vec![&self.inner]
+    }
 }
 
 #[async_trait::async_trait]
@@ -344,6 +388,9 @@ pub struct CircuitBreaker<S> {
     threshold: u32,
     cooldown: Duration,
     states: Arc<Mutex<HashMap<String, Breaker>>>,
+    /// One wrapper per (inner endpoint, target), since a wrapper carries the
+    /// target its circuit is keyed on: see [`memo`].
+    wrappers: Wrappers<(usize, u64), BreakerEndpoint>,
 }
 
 impl<S: Space> CircuitBreaker<S> {
@@ -355,6 +402,7 @@ impl<S: Space> CircuitBreaker<S> {
             threshold: threshold.max(1),
             cooldown,
             states: Arc::new(Mutex::new(HashMap::new())),
+            wrappers: Wrappers::new(),
         }
     }
 }
@@ -362,13 +410,18 @@ impl<S: Space> CircuitBreaker<S> {
 impl<S: Space> Space for CircuitBreaker<S> {
     fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
         self.inner.resolve(request, scope).map_endpoint(|inner| {
-            Arc::new(BreakerEndpoint {
-                inner,
-                target: request.target.as_str().to_string(),
-                threshold: self.threshold,
-                cooldown: self.cooldown,
-                states: Arc::clone(&self.states),
-            }) as Arc<dyn Endpoint>
+            let target = request.target.as_str();
+            self.wrappers.get_or_wrap(
+                (address(&inner), digest(target)),
+                |wrapper| wrapper.target == target,
+                || BreakerEndpoint {
+                    inner,
+                    target: target.to_string(),
+                    threshold: self.threshold,
+                    cooldown: self.cooldown,
+                    states: Arc::clone(&self.states),
+                },
+            ) as Arc<dyn Endpoint>
         })
     }
 
@@ -393,6 +446,12 @@ struct BreakerEndpoint {
     threshold: u32,
     cooldown: Duration,
     states: Arc<Mutex<HashMap<String, Breaker>>>,
+}
+
+impl Encloses for BreakerEndpoint {
+    fn enclosed(&self) -> Vec<&Arc<dyn Endpoint>> {
+        vec![&self.inner]
+    }
 }
 
 #[async_trait::async_trait]
@@ -457,12 +516,18 @@ impl Endpoint for BreakerEndpoint {
 /// each handed the arguments they declare.
 pub struct Failover {
     spaces: Vec<Arc<dyn Space>>,
+    /// One wrapper per (candidate endpoints, target), checked against each
+    /// candidate's captures on reuse: see [`memo`].
+    wrappers: Wrappers<(Vec<usize>, u64), FailoverEndpoint>,
 }
 
 impl Failover {
     /// Fail over across `spaces` in order — the first is the primary.
     pub fn new(spaces: Vec<Arc<dyn Space>>) -> Self {
-        Failover { spaces }
+        Failover {
+            spaces,
+            wrappers: Wrappers::new(),
+        }
     }
 }
 
@@ -491,13 +556,31 @@ impl Space for Failover {
         // with the FIRST hit's bindings — made candidate 2 read `None` for its own
         // variable and behave as it would for the bare target, silently and on the
         // branch that looks like success.
-        let candidates: Vec<Candidate> = hits
-            .iter()
-            .map(|hit| Candidate {
-                endpoint: Arc::clone(&hit.endpoint),
-                bindings: hit.bindings.clone(),
-            })
-            .collect();
+        //
+        // The wrapper is reused per (candidate endpoints, target) so the resource
+        // keeps one identity (ledger #534), and only while every candidate's
+        // captures still match: a space can rebind an endpoint under a different
+        // grammar, and the captures are what this wrapper exists to carry.
+        let key = (
+            hits.iter().map(|hit| address(&hit.endpoint)).collect(),
+            digest(request.target.as_str()),
+        );
+        let fits = |wrapper: &FailoverEndpoint| {
+            wrapper
+                .candidates
+                .iter()
+                .zip(&hits)
+                .all(|(candidate, hit)| candidate.bindings == hit.bindings)
+        };
+        let failover = self.wrappers.get_or_wrap(key, fits, || FailoverEndpoint {
+            candidates: hits
+                .iter()
+                .map(|hit| Candidate {
+                    endpoint: Arc::clone(&hit.endpoint),
+                    bindings: hit.bindings.clone(),
+                })
+                .collect(),
+        });
 
         // ★ THE CANONICAL: report it only when every hit agrees, otherwise none.
         //
@@ -532,7 +615,7 @@ impl Space for Failover {
         // different resource from one that rewrote.
         let agreed = hits.iter().all(|hit| hit.canonical == first.canonical);
         let mut resolved = hits.into_iter().next().expect("checked non-empty");
-        resolved.endpoint = Arc::new(FailoverEndpoint { candidates });
+        resolved.endpoint = failover;
         if !agreed {
             resolved.canonical = None;
         }
@@ -569,6 +652,12 @@ impl Space for Failover {
 /// a transient, idempotent failure.
 struct FailoverEndpoint {
     candidates: Vec<Candidate>,
+}
+
+impl Encloses for FailoverEndpoint {
+    fn enclosed(&self) -> Vec<&Arc<dyn Endpoint>> {
+        self.candidates.iter().map(|c| &c.endpoint).collect()
+    }
 }
 
 /// One failover target: an endpoint and the variables **its own** grammar captured
@@ -660,23 +749,35 @@ impl Endpoint for FailoverEndpoint {
 pub struct Timeout<S> {
     inner: S,
     budget: Duration,
+    /// One wrapper per (inner endpoint, target), since a wrapper names its target
+    /// when the budget elapses: see [`memo`].
+    wrappers: Wrappers<(usize, u64), TimeoutEndpoint>,
 }
 
 impl<S: Space> Timeout<S> {
     /// Wrap `inner`, bounding each invocation to `budget`.
     pub fn new(inner: S, budget: Duration) -> Self {
-        Timeout { inner, budget }
+        Timeout {
+            inner,
+            budget,
+            wrappers: Wrappers::new(),
+        }
     }
 }
 
 impl<S: Space> Space for Timeout<S> {
     fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
         self.inner.resolve(request, scope).map_endpoint(|inner| {
-            Arc::new(TimeoutEndpoint {
-                inner,
-                target: request.target.as_str().to_string(),
-                budget: self.budget,
-            }) as Arc<dyn Endpoint>
+            let target = request.target.as_str();
+            self.wrappers.get_or_wrap(
+                (address(&inner), digest(target)),
+                |wrapper| wrapper.target == target,
+                || TimeoutEndpoint {
+                    inner,
+                    target: target.to_string(),
+                    budget: self.budget,
+                },
+            ) as Arc<dyn Endpoint>
         })
     }
 
@@ -698,6 +799,12 @@ struct TimeoutEndpoint {
     inner: Arc<dyn Endpoint>,
     target: String,
     budget: Duration,
+}
+
+impl Encloses for TimeoutEndpoint {
+    fn enclosed(&self) -> Vec<&Arc<dyn Endpoint>> {
+        vec![&self.inner]
+    }
 }
 
 #[async_trait::async_trait]
@@ -737,6 +844,8 @@ impl Endpoint for TimeoutEndpoint {
 pub struct Throttle<S> {
     inner: S,
     rules: Vec<(String, Arc<async_lock::Semaphore>)>,
+    /// One wrapper per (inner endpoint, capped prefix): see [`memo`].
+    wrappers: Wrappers<(usize, String), ThrottleEndpoint>,
 }
 
 impl<S: Space> Throttle<S> {
@@ -745,6 +854,7 @@ impl<S: Space> Throttle<S> {
         Throttle {
             inner,
             rules: Vec::new(),
+            wrappers: Wrappers::new(),
         }
     }
 
@@ -761,12 +871,11 @@ impl<S: Space> Throttle<S> {
         self
     }
 
-    /// The most specific rule's semaphore matching `target`, if any.
-    fn permit_for(&self, target: &str) -> Option<Arc<async_lock::Semaphore>> {
+    /// The most specific rule matching `target` (its prefix and semaphore), if any.
+    fn rule_for(&self, target: &str) -> Option<&(String, Arc<async_lock::Semaphore>)> {
         self.rules
             .iter()
             .find(|(prefix, _)| target.starts_with(prefix))
-            .map(|(_, sem)| Arc::clone(sem))
     }
 }
 
@@ -779,12 +888,17 @@ impl<S: Space> Space for Throttle<S> {
         if request.verb == Verb::Meta {
             return Resolution::Hit(hit);
         }
-        match self.permit_for(request.target.as_str()) {
-            Some(semaphore) => {
-                let throttled = Arc::new(ThrottleEndpoint {
-                    inner: Arc::clone(&hit.endpoint),
-                    semaphore,
-                });
+        match self.rule_for(request.target.as_str()) {
+            Some((prefix, semaphore)) => {
+                let inner = &hit.endpoint;
+                let throttled = self.wrappers.get_or_wrap(
+                    (address(inner), prefix.clone()),
+                    |_| true,
+                    || ThrottleEndpoint {
+                        inner: Arc::clone(inner),
+                        semaphore: Arc::clone(semaphore),
+                    },
+                );
                 Resolution::Hit(hit.with_endpoint(throttled))
             }
             None => Resolution::Hit(hit),
@@ -809,6 +923,12 @@ impl<S: Space> Space for Throttle<S> {
 struct ThrottleEndpoint {
     inner: Arc<dyn Endpoint>,
     semaphore: Arc<async_lock::Semaphore>,
+}
+
+impl Encloses for ThrottleEndpoint {
+    fn enclosed(&self) -> Vec<&Arc<dyn Endpoint>> {
+        vec![&self.inner]
+    }
 }
 
 #[async_trait::async_trait]

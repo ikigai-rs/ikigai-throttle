@@ -62,6 +62,19 @@ is invoked on the variables **its own** grammar captured: candidates bound under
 different patterns (`urn:x/{id}` beside `urn:x/{name}`) each receive the
 arguments they declare, never the primary's.
 
+## One identity per resource
+
+A governor wraps the endpoint it resolved, and it keeps **one wrapper per inner
+endpoint**: a governed resource resolves to the same endpoint `Arc` every time,
+the over-budget stand-in included. The kernel memoizes each endpoint's capability
+floor by that identity, so a governed read is described once, not on every
+request; a fresh wrapper per resolution missed the memo every time. Measured on a
+module-shaped cached read (a description with three `ArgSpec`s, release build):
+`Timeout` 1257 ns before, 418 ns after; `Retry(Timeout)` 1380 ns before, 436 ns
+after; the bare space 380 ns. A rebound endpoint always gets a new wrapper, and the
+table is bounded and swept, so a space that builds a fresh endpoint per resolution
+cannot grow it or keep dropped endpoints alive. `tests/identity.rs` pins it.
+
 ## Transparent to structure
 
 The same holds for what a space says about itself. An overlay that encloses one
@@ -118,6 +131,11 @@ let space = RateLimit::new(inner)
     .limit("urn:httpGet",     Rate::new(30, Duration::from_secs(60)));
 // Kernel::new(Arc::new(space))
 ```
+
+Not to be confused with core's `Limit`. That is a structural carve-out: it removes
+a family of names from a space, so they resolve as `Unresolved`, whatever the
+traffic. `RateLimit` is a rate governor: the names stay bound and resolvable, and a
+caller over the budget is refused for now, with a hint of when to come back.
 
 Longest-prefix wins; an unmatched target is never rate-limited; `Meta`
 (self-description) is exempt — an agent must always be able to read what it may or
