@@ -79,10 +79,10 @@ fn migration() -> Arc<AliasTable> {
 /// holds no alias table of its own. The only thing that can make the two names one
 /// resource is the canonical riding back up through the overlay.
 ///
-/// ★ Returned CONCRETE, not as `Arc<dyn Space>`: core implements `Space` for the
-/// space types but not for `Arc<dyn Space>`, and every governor here is generic
-/// over `S: Space`, so an erased inner space cannot be wrapped without a
-/// delegating newtype. Reported up.
+/// Returned concrete as a plain choice: core implements `Space` for `Arc<S>` with
+/// `S: ?Sized` (since 0.1.65, below this crate's floor), so every governor here,
+/// generic over `S: Space`, wraps an erased `Arc<dyn Space>` just as well, as
+/// `tests/conformance.rs` does throughout.
 fn aliased(value: Arc<Mutex<String>>) -> Alias {
     Alias::new(migration(), backing(value))
 }
