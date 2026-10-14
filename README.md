@@ -181,7 +181,9 @@ comes out of every overlay unchanged (`Retry` re-issues a transient one `attempt
 times and returns the last); each overlay's own refusal is typed as its semantics
 say (open circuit: transient `Unavailable`; elapsed budget: transient `Timeout`;
 rate limit: permanent `Endpoint` with a retry hint) and none of them is ever
-cached.
+cached. `REQUIRED` runs on the `Sink` too, and a negative control (endpoints that
+ignore a required input or refuse its absence untyped) is found through every
+overlay exactly as it is bare.
 
 ## Notes
 

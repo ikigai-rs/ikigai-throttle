@@ -41,6 +41,11 @@
 //!   downgrade.
 //! - `pure("upper")`: it reads nothing, so it carries no foreign thread by
 //!   construction.
+//! - `required_on_mutating()` (conformance 0.8's REQUIRED): `upper`'s `in` is
+//!   dropped by default, and this turns the drop on for `cell`'s `Sink` too, so its
+//!   `content` is left out and the call must come back a typed `MissingArgument`
+//!   through every overlay. Safe here because the fixture is in memory: a drop the
+//!   endpoint wrongly accepted would write a test cell, nothing else.
 //! - No opt-outs, no namespace (no RDF face: the overlays keep no state a Turtle
 //!   face could serve), NAMES runs (every id is kebab-case).
 //! - `host_named_space` for every overlay constructor (conformance 0.6's
@@ -96,6 +101,13 @@
 //!   limit protects is not touched. The same ordering means a cache hit is
 //!   charged against the window. Pinned as what the code does; a `Space` sees no
 //!   cache and no capability, so this is the kernel's ordering, reported up.
+//! - **REQUIRED sees through every overlay** ([`required_sees_through_every_overlay`]):
+//!   a clean REQUIRED over the fixture says only that no overlay turned a typed
+//!   refusal into something else, and the 0.8.0 report does not list what it
+//!   dropped. So a negative control: a `Source` and a `Sink` that ignore their
+//!   required input and a `Source` that refuses its absence untyped are found
+//!   through every overlay exactly as they are bare, beside a conforming one that
+//!   is not.
 //! - **`Failover` over mirrors doubles the catalog** (in [`conforms`]): its
 //!   `entries()` concatenates every target's, so two mirrors of one space list 8
 //!   entries. Since conformance 0.4 the walk fires once per REQUEST, so each of
@@ -103,7 +115,7 @@
 //!   collapsed (under 0.2 it was walked twice: 10 actions, every one fired twice).
 
 use futures::executor::block_on;
-use ikigai_conformance::{Check, Report, SpaceNaming, Suite};
+use ikigai_conformance::{Check, Checks, Report, SpaceNaming, Suite};
 use ikigai_core::{
     ActionSpec, ArgRef, ArgSpec, Capability, Description, Endpoint, EndpointSpace, Error, Exact,
     Expiry, FnEndpoint, Invocation, Iri, Kernel, ReprType, Representation, Request, Space, Thread,
@@ -316,6 +328,7 @@ fn suite() -> Suite {
         .cacheable("cell")
         .cacheable("upper")
         .pure("upper")
+        .required_on_mutating()
 }
 
 /// How the SPACE-NAME declaration names each composition: the call, as the
@@ -348,6 +361,7 @@ fn assert_shape(label: &str, report: &Report, actions: usize) {
     assert!(report.declared.opted_out.is_empty(), "{label}: {report}");
     assert_eq!(report.declared.cacheable, ["cell", "upper"], "{label}");
     assert_eq!(report.declared.pure, ["upper"], "{label}");
+    assert!(report.declared.required_on_mutating, "{label}: {report}");
     let spaces: Vec<(&str, SpaceNaming)> = report
         .declared
         .spaces
@@ -433,6 +447,80 @@ fn conforms() {
         5,
         "each action's second binding is collapsed onto the first: {report}"
     );
+}
+
+/// REQUIRED's negative control: three defective endpoints and one conforming one,
+/// walked bare and through every overlay with REQUIRED alone selected (on the
+/// mutating verbs too). Every defect is found through every overlay, with the same detail as bare, and the
+/// conforming endpoint is not: an overlay neither hides a call that succeeded
+/// without its required input nor turns a typed refusal into an untyped one.
+#[test]
+fn required_sees_through_every_overlay() {
+    fn space() -> Arc<dyn Space> {
+        let lax = FnEndpoint::new("lax", |_inv| Ok(ok("fine without it"))).with_description(
+            Description::new("lax")
+                .title("Ignores its required input")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("in").class(XSD_STRING))
+                .output(TEXT),
+        );
+        let untyped = FnEndpoint::new("untyped", |inv| match inv.inline_str("in") {
+            Ok(value) => Ok(ok(value.to_string())),
+            Err(_) => Err(Error::Endpoint("no input".into())),
+        })
+        .with_description(
+            Description::new("untyped")
+                .title("Refuses a missing input untyped")
+                .verb(Verb::Source)
+                .input(ArgSpec::new("in").class(XSD_STRING))
+                .output(TEXT),
+        );
+        let lax_sink = FnEndpoint::new("lax-sink", |_inv| Ok(ok("ok"))).with_description(
+            Description::new("lax-sink")
+                .title("Writes without its required content")
+                .action(
+                    ActionSpec::new(Verb::Sink)
+                        .input(ArgSpec::new("content").class(XSD_STRING))
+                        .requires(WRITE_CAP)
+                        .output(TEXT),
+                ),
+        );
+        let leaf = Leaf::new();
+        Arc::new(
+            EndpointSpace::new()
+                .bind(Exact::new("urn:lax"), lax)
+                .bind(Exact::new("urn:lax-sink"), lax_sink)
+                .bind(Exact::new("urn:untyped"), untyped)
+                .bind_arc(Exact::new("urn:upper"), Arc::clone(&leaf.upper)),
+        )
+    }
+    fn found(report: &Report) -> Vec<(String, String)> {
+        let mut found: Vec<(String, String)> = report
+            .of(Check::Required)
+            .map(|f| (f.endpoint.clone(), f.detail.clone()))
+            .collect();
+        found.sort();
+        found
+    }
+
+    let required = || Suite::new().checks(Checks::REQUIRED).required_on_mutating();
+    let bare = required().run_blocking(&Kernel::new(space()));
+    eprintln!("required, bare: {bare}");
+    let expected = found(&bare);
+    let ids: Vec<&str> = expected.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["lax", "lax-sink", "untyped"], "{bare}");
+    assert_eq!(bare.findings.len(), 3, "{bare}");
+
+    for (label, compose, _) in overlays() {
+        let report = required().run_blocking(&Kernel::new(compose(space())));
+        eprintln!("required, {label}: {report}");
+        assert_eq!(
+            found(&report),
+            expected,
+            "{label}: REQUIRED through the overlay is REQUIRED without it"
+        );
+        assert_eq!(report.findings.len(), 3, "{label}: {report}");
+    }
 }
 
 /// The catalog and every description through an overlay are the bare space's,
