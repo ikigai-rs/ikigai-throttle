@@ -8,3 +8,6 @@ concurrency:
 jobs:
   ci:
     uses: ikigai-rs/.github/.github/workflows/rust.yml@main
+    # The governors read time from a core Clock, so the lib builds for wasm32
+    # (ledger #1507). Compile-only: tests/wasm_clean.rs guards the runtime half.
+    with: { wasm-lib: true }

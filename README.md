@@ -187,8 +187,18 @@ overlay exactly as it is bare.
 
 ## Notes
 
-- Native crate — `RateLimit`/`CircuitBreaker` keep a sliding window of `Instant`s;
-  a wasm face would inject a clock (a later refinement).
+- **Time comes from a core `Clock`.** `RateLimit` (its window) and
+  `CircuitBreaker` (its cooldown) read the clock given with `with_clock`, and
+  default to a monotonic clock on a native target. Hand them the clock you gave
+  your kernel, or a test clock that moves only when the test moves it. Time is
+  read in whole milliseconds. Never a temporal corridor's pinned clock: a window
+  measured on a stopped clock never slides.
+- **wasm32-unknown-unknown:** every overlay but `Timeout` builds there (CI lints
+  the lib on wasm32). There is no default clock on wasm32, so the host installs
+  one, as it does for its kernel; a `RateLimit` or `CircuitBreaker` without one
+  refuses what it governs with an error naming `with_clock`, and never panics.
+  `Timeout` is native only: it needs a timer that wakes a future, which a clock
+  is not, and futures-timer's native backend panics on wasm32.
 - `Timeout` bounds *genuinely-async* work. A purely **synchronous blocking** call
   inside an invoke never yields to the executor, so a single-threaded runtime
   can't fire the timer; that hang is fixed at the transport (a socket read
