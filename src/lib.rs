@@ -40,6 +40,15 @@
 //! through a governor to the doors it guards. [`Failover`], enclosing several,
 //! is reported opaque; see its `topology`.
 //!
+//! **Time comes from a core [`Clock`]**, never from the platform directly. The two
+//! governors that measure time, [`RateLimit`] (its window) and [`CircuitBreaker`]
+//! (its cooldown), read the clock they were given with `with_clock`, and default to
+//! a monotonic clock on a native target. On wasm32-unknown-unknown, where reading
+//! platform time panics, there is no default: the host installs a clock as it does
+//! for its kernel, and a governor without one refuses rather than guessing.
+//! [`Timeout`] needs a timer, which a clock cannot be, so it is native only; every
+//! other overlay here builds for wasm32 unchanged.
+//!
 //! The reliability overlays read the request **verb** (idempotency governs whether
 //! a re-issue is *safe*) and [`Error::is_transient`](ikigai_core::Error::is_transient)
 //! (whether it's *worth* retrying). Logging, egress-filtering, and load-balancing
@@ -60,16 +69,47 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod memo;
 use memo::{address, digest, Encloses, Wrappers};
 
+#[cfg(not(target_arch = "wasm32"))]
+mod native_clock;
+#[cfg(not(target_arch = "wasm32"))]
+mod timeout;
+#[cfg(not(target_arch = "wasm32"))]
+pub use timeout::Timeout;
+
 use ikigai_core::{
-    Bindings, Description, Endpoint, Error, Invocation, Iri, Representation, Request, Resolution,
-    Resolved, Scope, Space, SpaceEntry, Topology, Verb,
+    Bindings, Clock, Description, Endpoint, Error, Invocation, Iri, Representation, Request,
+    Resolution, Resolved, Scope, Space, SpaceEntry, Time, Topology, Verb,
 };
 use std::sync::Arc;
+
+/// The clock a governor reads when its host installed none: on a native target a
+/// monotonic one (the private `native_clock` module); on wasm32 none at all, because
+/// there is no platform time to read there without a host, and reading it anyway is
+/// a runtime panic. A governor that has no clock REFUSES what it governs, naming
+/// `with_clock`, rather than guessing at time (see [`RateLimit::with_clock`]).
+fn default_clock() -> Option<Arc<dyn Clock>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let clock: Option<Arc<dyn Clock>> = Some(Arc::new(native_clock::Monotonic::new()));
+    #[cfg(target_arch = "wasm32")]
+    let clock: Option<Arc<dyn Clock>> = None;
+    clock
+}
+
+/// A duration in whole milliseconds, the resolution of a core [`Time`].
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Milliseconds from `since` to `now`; zero if the clock reads earlier than `since`
+/// (a host's clock is allowed to, and a governor must not panic or wrap on it).
+fn elapsed(now: Time, since: Time) -> u64 {
+    now.as_millis().saturating_sub(since.as_millis())
+}
 
 /// A velocity cap: at most `max` resolutions per `window`.
 #[derive(Clone, Copy, Debug)]
@@ -95,7 +135,9 @@ pub struct RateLimit<S> {
     rules: Vec<(String, Rate)>,
     /// Shared with every over-budget stand-in, which reads its retry hint here
     /// when it refuses rather than carrying one fixed when it was built.
-    hits: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+    hits: Arc<Mutex<HashMap<String, VecDeque<Time>>>>,
+    /// Where the window's time comes from: see [`with_clock`](Self::with_clock).
+    clock: Option<Arc<dyn Clock>>,
     /// One stand-in per (wrapped endpoint, limited prefix): see [`memo`].
     stand_ins: Wrappers<(usize, String), RateLimited>,
 }
@@ -107,8 +149,53 @@ impl<S: Space> RateLimit<S> {
             inner,
             rules: Vec::new(),
             hits: Arc::new(Mutex::new(HashMap::new())),
+            clock: default_clock(),
             stand_ins: Wrappers::new(),
         }
+    }
+
+    /// Measure the window on `clock` (builder), instead of the default: a monotonic
+    /// clock on a native target, and **none on wasm32**, where a host must install
+    /// one. Without a clock, every resolution under a limited prefix is refused with
+    /// a permanent [`Error::Endpoint`] that names this method; nothing panics.
+    ///
+    /// Give it the clock the host gave its kernel (`Kernel::with_clock`) when the two
+    /// should agree, or a test clock that advances only when the test says so. Time
+    /// is read in whole milliseconds, a core [`Time`]'s resolution, so a window
+    /// shorter than a millisecond is not meaningful.
+    ///
+    /// Not the request scope's clock: a temporal corridor pins time for the DOMAIN
+    /// (an as-of read), and a window measured on a pinned clock would never slide.
+    /// How fast a prefix is being hit is operational time, which core keeps on the
+    /// kernel's clock for the same reason (ledger #517).
+    ///
+    /// ```
+    /// use ikigai_core::{Capability, EndpointSpace, Exact, FixedClock, FnEndpoint,
+    ///     Iri, Kernel, ReprType, Representation, Request, Verb};
+    /// use ikigai_throttle::{Rate, RateLimit};
+    /// use std::{sync::Arc, time::Duration};
+    ///
+    /// let leaf = EndpointSpace::new().bind(
+    ///     Exact::new("urn:demo:x"),
+    ///     FnEndpoint::new("x", |_| Ok(Representation::new(ReprType::new("text/plain"), b"ok".to_vec()))),
+    /// );
+    /// // A clock that never moves: the window never slides, however long the test runs.
+    /// let kernel = Kernel::new(Arc::new(
+    ///     RateLimit::new(leaf)
+    ///         .limit("urn:demo:", Rate::new(1, Duration::from_millis(1)))
+    ///         .with_clock(Arc::new(FixedClock::at(1_000))),
+    /// ));
+    /// let read = || futures::executor::block_on(kernel.issue(
+    ///     Request::new(Verb::Source, Iri::parse("urn:demo:x").unwrap()),
+    ///     &Capability::root(),
+    /// ));
+    /// assert!(read().is_ok());
+    /// std::thread::sleep(Duration::from_millis(5));
+    /// assert!(read().is_err(), "the window is measured on the clock it was given");
+    /// ```
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
     }
 
     /// Cap resolutions of resources whose IRI starts with `prefix` at `rate`
@@ -143,17 +230,20 @@ impl<S: Space> Space for RateLimit<S> {
             return Resolution::Hit(hit);
         };
 
-        let now = Instant::now();
+        // No clock, no window: refuse rather than guess (see `with_clock`).
+        let now = self.clock.as_ref().map(|clock| clock.now());
         let mut hits = self.hits.lock().expect("throttle lock");
         let window = hits.entry(prefix.clone()).or_default();
-        // Drop timestamps older than the window.
-        while window
-            .front()
-            .is_some_and(|&t| now.duration_since(t) >= rate.window)
-        {
-            window.pop_front();
+        if let Some(now) = now {
+            // Drop timestamps older than the window.
+            while window
+                .front()
+                .is_some_and(|&t| elapsed(now, t) >= millis(rate.window))
+            {
+                window.pop_front();
+            }
         }
-        if window.len() as u32 >= rate.max {
+        if now.is_none() || window.len() as u32 >= rate.max {
             drop(hits);
             // Substitute the endpoint, keep everything else the inner resolution
             // reported. Being over budget does not make this a different resource:
@@ -171,11 +261,14 @@ impl<S: Space> Space for RateLimit<S> {
                     prefix: prefix.clone(),
                     rate: *rate,
                     hits: Arc::clone(&self.hits),
+                    clock: self.clock.clone(),
                 },
             );
             return Resolution::Hit(hit.with_endpoint(stand_in));
         }
-        window.push_back(now);
+        if let Some(now) = now {
+            window.push_back(now);
+        }
         Resolution::Hit(hit)
     }
 
@@ -227,7 +320,9 @@ struct RateLimited {
     inner: Arc<dyn Endpoint>,
     prefix: String,
     rate: Rate,
-    hits: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+    hits: Arc<Mutex<HashMap<String, VecDeque<Time>>>>,
+    /// The governor's clock; `None` is the refusal for having none.
+    clock: Option<Arc<dyn Clock>>,
 }
 
 impl RateLimited {
@@ -236,12 +331,15 @@ impl RateLimited {
     /// operator input, and it is over budget on an EMPTY window: unwrapping the
     /// front there panicked on the first resolve instead of refusing. A governor
     /// must refuse, never panic, so fall back to the whole window.
-    fn retry_after(&self) -> Duration {
-        let now = Instant::now();
+    fn retry_after(&self, now: Time) -> Duration {
         let hits = self.hits.lock().expect("throttle lock");
         hits.get(&self.prefix)
             .and_then(|window| window.front())
-            .map(|&t| self.rate.window.saturating_sub(now.duration_since(t)))
+            .map(|&t| {
+                self.rate
+                    .window
+                    .saturating_sub(Duration::from_millis(elapsed(now, t)))
+            })
             .unwrap_or(self.rate.window)
     }
 }
@@ -255,12 +353,19 @@ impl Encloses for RateLimited {
 #[async_trait::async_trait]
 impl Endpoint for RateLimited {
     async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation, Error> {
+        let Some(clock) = &self.clock else {
+            return Err(Error::Endpoint(format!(
+                "rate-limited: `{}` has no clock to measure its window — \
+                 install one with RateLimit::with_clock",
+                self.prefix
+            )));
+        };
         Err(Error::Endpoint(format!(
             "rate-limited: `{}` is capped at {}/{}s — retry after {}s",
             self.prefix,
             self.rate.max,
             self.rate.window.as_secs().max(1),
-            self.retry_after().as_secs() + 1
+            self.retry_after(clock.now()).as_secs() + 1
         )))
     }
 
@@ -371,7 +476,7 @@ struct Breaker {
     /// Consecutive transient failures while closed.
     failures: u32,
     /// When the circuit tripped open, if it is open.
-    opened_at: Option<Instant>,
+    opened_at: Option<Time>,
 }
 
 /// A [`Space`] overlay implementing Nygard's **Circuit Breaker** (from *Release
@@ -388,6 +493,8 @@ pub struct CircuitBreaker<S> {
     threshold: u32,
     cooldown: Duration,
     states: Arc<Mutex<HashMap<String, Breaker>>>,
+    /// Where the cooldown's time comes from: see [`with_clock`](Self::with_clock).
+    clock: Option<Arc<dyn Clock>>,
     /// One wrapper per (inner endpoint, target), since a wrapper carries the
     /// target its circuit is keyed on: see [`memo`].
     wrappers: Wrappers<(usize, u64), BreakerEndpoint>,
@@ -402,8 +509,23 @@ impl<S: Space> CircuitBreaker<S> {
             threshold: threshold.max(1),
             cooldown,
             states: Arc::new(Mutex::new(HashMap::new())),
+            clock: default_clock(),
             wrappers: Wrappers::new(),
         }
+    }
+
+    /// Measure the cooldown on `clock` (builder), instead of the default: a
+    /// monotonic clock on a native target, and **none on wasm32**, where a host must
+    /// install one. Without a clock the breaker refuses every call with a permanent
+    /// [`Error::Endpoint`] naming this method, before touching the dependency;
+    /// nothing panics. The same reasoning as [`RateLimit::with_clock`]: the
+    /// kernel's clock or a test clock, never a temporal corridor's pinned one.
+    ///
+    /// Call it before the first resolution: a wrapper built by then keeps the clock
+    /// it was built with.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
     }
 }
 
@@ -420,6 +542,7 @@ impl<S: Space> Space for CircuitBreaker<S> {
                     threshold: self.threshold,
                     cooldown: self.cooldown,
                     states: Arc::clone(&self.states),
+                    clock: self.clock.clone(),
                 },
             ) as Arc<dyn Endpoint>
         })
@@ -446,6 +569,7 @@ struct BreakerEndpoint {
     threshold: u32,
     cooldown: Duration,
     states: Arc<Mutex<HashMap<String, Breaker>>>,
+    clock: Option<Arc<dyn Clock>>,
 }
 
 impl Encloses for BreakerEndpoint {
@@ -457,12 +581,20 @@ impl Encloses for BreakerEndpoint {
 #[async_trait::async_trait]
 impl Endpoint for BreakerEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+        // No clock, no cooldown to measure: refuse rather than guess (`with_clock`).
+        let Some(clock) = &self.clock else {
+            return Err(Error::Endpoint(format!(
+                "circuit breaker for `{}` has no clock to measure its cooldown — \
+                 install one with CircuitBreaker::with_clock",
+                self.target
+            )));
+        };
         // Gate: if open and still cooling, fail fast without touching the dependency.
         {
             let mut states = self.states.lock().expect("breaker lock");
             let breaker = states.entry(self.target.clone()).or_default();
             if let Some(opened) = breaker.opened_at {
-                if Instant::now().duration_since(opened) < self.cooldown {
+                if elapsed(clock.now(), opened) < millis(self.cooldown) {
                     return Err(Error::Unavailable(format!(
                         "circuit open for `{}` — failing fast until it cools down",
                         self.target
@@ -484,7 +616,7 @@ impl Endpoint for BreakerEndpoint {
             Err(e) if e.is_transient() => {
                 breaker.failures += 1;
                 if breaker.failures >= self.threshold {
-                    breaker.opened_at = Some(Instant::now()); // trip, or re-open a failed probe
+                    breaker.opened_at = Some(clock.now()); // trip, or re-open a failed probe
                 }
             }
             Err(_) => {} // permanent errors don't count toward tripping
@@ -737,102 +869,6 @@ impl Endpoint for FailoverEndpoint {
     }
 }
 
-/// A [`Space`] overlay that **bounds how long** an invocation may run. It races the
-/// inner endpoint's invoke against a timer; if the budget elapses first, the work
-/// is dropped and it returns a **transient** [`Timeout`](Error::Timeout) — so a
-/// [`Retry`]/[`Failover`] above can move on. Applies to every verb (a slow `Sink`
-/// is bounded too); the re-issue safety of a timed-out mutation is the verb's
-/// concern, not the timeout's. NOTE: this bounds genuinely *async* work — a purely
-/// synchronous blocking call inside the invoke (e.g. a blocking socket read) never
-/// yields, so a single-threaded executor can't fire the timer; that hang is fixed
-/// at the transport (a socket read timeout), complementary to this.
-pub struct Timeout<S> {
-    inner: S,
-    budget: Duration,
-    /// One wrapper per (inner endpoint, target), since a wrapper names its target
-    /// when the budget elapses: see [`memo`].
-    wrappers: Wrappers<(usize, u64), TimeoutEndpoint>,
-}
-
-impl<S: Space> Timeout<S> {
-    /// Wrap `inner`, bounding each invocation to `budget`.
-    pub fn new(inner: S, budget: Duration) -> Self {
-        Timeout {
-            inner,
-            budget,
-            wrappers: Wrappers::new(),
-        }
-    }
-}
-
-impl<S: Space> Space for Timeout<S> {
-    fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
-        self.inner.resolve(request, scope).map_endpoint(|inner| {
-            let target = request.target.as_str();
-            self.wrappers.get_or_wrap(
-                (address(&inner), digest(target)),
-                |wrapper| wrapper.target == target,
-                || TimeoutEndpoint {
-                    inner,
-                    target: target.to_string(),
-                    budget: self.budget,
-                },
-            ) as Arc<dyn Endpoint>
-        })
-    }
-
-    fn entries(&self) -> Option<Vec<SpaceEntry>> {
-        self.inner.entries()
-    }
-
-    fn id(&self) -> Option<Iri> {
-        self.inner.id()
-    }
-
-    fn topology(&self) -> Topology {
-        self.inner.topology()
-    }
-}
-
-/// The endpoint a [`Timeout`] resolves to: race the inner invoke against the budget.
-struct TimeoutEndpoint {
-    inner: Arc<dyn Endpoint>,
-    target: String,
-    budget: Duration,
-}
-
-impl Encloses for TimeoutEndpoint {
-    fn enclosed(&self) -> Vec<&Arc<dyn Endpoint>> {
-        vec![&self.inner]
-    }
-}
-
-#[async_trait::async_trait]
-impl Endpoint for TimeoutEndpoint {
-    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
-        let work = self.inner.invoke(inv);
-        futures::pin_mut!(work);
-        match futures::future::select(work, futures_timer::Delay::new(self.budget)).await {
-            // The work finished within budget.
-            futures::future::Either::Left((result, _timer)) => result,
-            // The timer won — drop the in-flight work and report a transient timeout.
-            futures::future::Either::Right((_elapsed, _work)) => Err(Error::Timeout(format!(
-                "`{}` exceeded {}ms",
-                self.target,
-                self.budget.as_millis()
-            ))),
-        }
-    }
-
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn describe(&self) -> Description {
-        self.inner.describe()
-    }
-}
-
 /// A [`Space`] overlay that caps **concurrency** by URI prefix and **parks** the
 /// excess: at most N invocations of resources under a prefix run at once, and the
 /// N+1th *waits* for a slot to free rather than erroring. This is `RateLimit`'s
@@ -953,9 +989,25 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{
-        Capability, EndpointSpace, Exact, FnEndpoint, Iri, Kernel, ReprType, UriTemplate,
+        Capability, EndpointSpace, Exact, FixedClock, FnEndpoint, Iri, Kernel, ReprType,
+        UriTemplate,
     };
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+    /// A clock that moves only when the test moves it. Core ships `FixedClock`, which
+    /// never moves, and says a crate that must advance time writes its own.
+    #[derive(Clone, Default)]
+    struct Manual(Arc<AtomicU64>);
+    impl Manual {
+        fn advance(&self, millis: u64) {
+            self.0.fetch_add(millis, Ordering::SeqCst);
+        }
+    }
+    impl Clock for Manual {
+        fn now(&self) -> Time {
+            Time::from_millis(self.0.load(Ordering::SeqCst))
+        }
+    }
 
     /// An endpoint whose failure is toggleable, counting invocations — so a test
     /// can watch the breaker stop reaching it, then let it recover.
@@ -1033,11 +1085,11 @@ mod tests {
             seen: seen.clone(),
         });
         let space = EndpointSpace::new().bind_arc(Exact::new("urn:dep"), endpoint);
-        let kernel = Kernel::new(Arc::new(CircuitBreaker::new(
-            space,
-            2,
-            Duration::from_millis(20),
-        )));
+        let clock = Manual::default();
+        let kernel = Kernel::new(Arc::new(
+            CircuitBreaker::new(space, 2, Duration::from_millis(20))
+                .with_clock(Arc::new(clock.clone())),
+        ));
         let src = || Request::new(Verb::Source, Iri::parse("urn:dep").unwrap());
 
         // Two transient failures trip the circuit — both reach the dependency.
@@ -1054,9 +1106,16 @@ mod tests {
             "fast-failed, dependency untouched"
         );
 
-        // Dependency recovers; after the cooldown, a half-open probe closes the circuit.
+        // Dependency recovers, but one millisecond short of the cooldown the circuit
+        // is still open: the boundary is exact because the clock is the test's.
         fail.store(false, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(30));
+        clock.advance(19);
+        let err = block_on(kernel.issue(src(), &Capability::root())).unwrap_err();
+        assert!(format!("{err}").contains("circuit open"), "{err}");
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "still cooling: untouched");
+
+        // At the cooldown, a half-open probe closes the circuit.
+        clock.advance(1);
         assert!(block_on(kernel.issue(src(), &Capability::root())).is_ok());
         assert_eq!(
             seen.load(Ordering::SeqCst),
@@ -1345,6 +1404,14 @@ mod tests {
         Kernel::new(Arc::new(space))
     }
 
+    fn kernel_on(rate: Rate, clock: Arc<dyn Clock>) -> Kernel {
+        let inner = EndpointSpace::new().bind(Exact::new("urn:demo:tick"), always_ok());
+        let space = RateLimit::new(inner)
+            .limit("urn:demo:", rate)
+            .with_clock(clock);
+        Kernel::new(Arc::new(space))
+    }
+
     fn tick(kernel: &Kernel) -> Result<Representation, Error> {
         block_on(kernel.issue(
             Request::new(Verb::Source, Iri::parse("urn:demo:tick").unwrap()),
@@ -1391,11 +1458,115 @@ mod tests {
 
     #[test]
     fn the_window_slides() {
-        // One per 1ms: after the window elapses, calls pass again.
-        let kernel = kernel_with(Rate::new(1, Duration::from_millis(1)));
+        // One per 10ms, on a clock the test moves: refused until the oldest hit is a
+        // whole window old, and not a millisecond sooner.
+        let clock = Manual::default();
+        let kernel = kernel_on(
+            Rate::new(1, Duration::from_millis(10)),
+            Arc::new(clock.clone()),
+        );
+        assert!(tick(&kernel).is_ok());
+        clock.advance(9);
+        assert!(
+            tick(&kernel).is_err(),
+            "one millisecond short of the window"
+        );
+        clock.advance(1);
+        assert!(tick(&kernel).is_ok(), "the window should have slid");
+    }
+
+    /// The window is measured on the governor's clock, never on the platform's: on
+    /// a clock that does not move, real time passing slides nothing. Reading
+    /// `Instant::now()` directly (as every governor here did before ledger #1507)
+    /// slides it, and panics on wasm32.
+    #[test]
+    fn a_rate_window_is_measured_on_the_governors_clock() {
+        let kernel = kernel_on(
+            Rate::new(1, Duration::from_millis(1)),
+            Arc::new(FixedClock::at(1_000)),
+        );
         assert!(tick(&kernel).is_ok());
         std::thread::sleep(Duration::from_millis(5));
-        assert!(tick(&kernel).is_ok(), "the window should have slid");
+        assert!(
+            tick(&kernel).is_err(),
+            "real time passed; the clock did not"
+        );
+    }
+
+    /// The breaker's cooldown likewise: tripped on a stopped clock, it stays open
+    /// however long real time runs, without touching the dependency.
+    #[test]
+    fn a_breaker_cooldown_is_measured_on_the_governors_clock() {
+        let seen = Arc::new(AtomicU32::new(0));
+        let endpoint = Arc::new(Controlled {
+            fail: Arc::new(AtomicBool::new(true)),
+            seen: seen.clone(),
+        });
+        let space = EndpointSpace::new().bind_arc(Exact::new("urn:dep"), endpoint);
+        let kernel = Kernel::new(Arc::new(
+            CircuitBreaker::new(space, 1, Duration::from_millis(1))
+                .with_clock(Arc::new(FixedClock::at(1_000))),
+        ));
+        let src = || Request::new(Verb::Source, Iri::parse("urn:dep").unwrap());
+        assert!(block_on(kernel.issue(src(), &Capability::root())).is_err());
+        std::thread::sleep(Duration::from_millis(5));
+        let err = block_on(kernel.issue(src(), &Capability::root())).unwrap_err();
+        assert!(format!("{err}").contains("circuit open"), "{err}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "no probe: still cooling");
+    }
+
+    /// With no clock (wasm32 when the host installed none), a rate limit cannot
+    /// measure its window, so it REFUSES what it governs and says how to fix it:
+    /// never a panic, and never a silent pass. Unlimited prefixes are untouched.
+    #[test]
+    fn a_rate_limit_without_a_clock_refuses_and_names_the_fix() {
+        let inner = EndpointSpace::new()
+            .bind(Exact::new("urn:demo:tick"), always_ok())
+            .bind(Exact::new("urn:other:x"), always_ok());
+        let mut space =
+            RateLimit::new(inner).limit("urn:demo:", Rate::new(100, Duration::from_secs(1)));
+        space.clock = None; // what `new` leaves on wasm32
+        let kernel = Kernel::new(Arc::new(space));
+        let err = tick(&kernel).unwrap_err();
+        assert!(matches!(err, Error::Endpoint(_)), "{err:?}");
+        assert!(err.to_string().contains("RateLimit::with_clock"), "{err}");
+        let other = block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse("urn:other:x").unwrap()),
+            &Capability::root(),
+        ));
+        assert!(
+            other.is_ok(),
+            "an unlimited prefix needs no clock: {other:?}"
+        );
+    }
+
+    /// The breaker without a clock refuses before touching the dependency.
+    #[test]
+    fn a_breaker_without_a_clock_refuses_and_names_the_fix() {
+        let seen = Arc::new(AtomicU32::new(0));
+        let endpoint = Arc::new(Controlled {
+            fail: Arc::new(AtomicBool::new(false)),
+            seen: seen.clone(),
+        });
+        let space = EndpointSpace::new().bind_arc(Exact::new("urn:dep"), endpoint);
+        let mut breaker = CircuitBreaker::new(space, 2, Duration::from_secs(1));
+        breaker.clock = None; // what `new` leaves on wasm32
+        let kernel = Kernel::new(Arc::new(breaker));
+        let err = block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse("urn:dep").unwrap()),
+            &Capability::root(),
+        ))
+        .unwrap_err();
+        assert!(matches!(err, Error::Endpoint(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("CircuitBreaker::with_clock"),
+            "{err}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "the dependency was not touched"
+        );
     }
 
     #[test]

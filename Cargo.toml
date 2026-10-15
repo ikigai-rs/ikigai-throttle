@@ -8,8 +8,10 @@ authors = ["Brian Sletten <brian.sletten@gmail.com>"]
 repository = "https://github.com/ikigai-rs/ikigai-throttle"
 
 [dependencies]
-# Native crate: it keeps a sliding window of Instants, so no wasm face (a wasm
-# throttle would inject a Clock — a later refinement). Wraps ANY Space.
+# Wraps ANY Space. Builds for wasm32-unknown-unknown (CI's `wasm32 lib clippy`):
+# RateLimit and CircuitBreaker read time from a core Clock (`with_clock`; on wasm32
+# the host must install one, ledger #1507) and never from the platform. Timeout is
+# native only, see below. Clock and Time are far older than the 0.1.78 floor.
 ikigai-core = "0.1.78" # Space::topology + Space::id (every single-space
                       # overlay forwards both, ledger #978);
                       # Resolution::map_endpoint (an overlay must forward
@@ -19,12 +21,18 @@ ikigai-core = "0.1.78" # Space::topology + Space::id (every single-space
                       # invoked on the captures ITS OWN grammar took)
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
-# Timeout races the invoke against a timer: `select` (futures) + a runtime-agnostic
-# timer (futures-timer works under the kernel's `block_on`, no tokio).
-futures = "0.3"
-futures-timer = "3"
 # Throttle parks the excess on a fair async Semaphore (runtime-agnostic).
 async-lock = "3"
+
+# Timeout races the invoke against a timer: `select` (futures) + a runtime-agnostic
+# timer (futures-timer works under the kernel's `block_on`, no tokio). NATIVE ONLY:
+# futures-timer's native backend reads `Instant::now()` and runs a helper thread,
+# which compile on wasm32 and fail there at runtime, so Timeout and both crates are
+# left out of a wasm32 build
+# (src/timeout.rs says what a wasm Timeout would need).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+futures = "0.3"
+futures-timer = "3"
 
 [dev-dependencies]
 # The module recipe as one test (`tests/conformance.rs`). This crate binds no

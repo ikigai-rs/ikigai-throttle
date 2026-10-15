@@ -117,12 +117,12 @@
 use futures::executor::block_on;
 use ikigai_conformance::{Check, Checks, Report, SpaceNaming, Suite};
 use ikigai_core::{
-    ActionSpec, ArgRef, ArgSpec, Capability, Description, Endpoint, EndpointSpace, Error, Exact,
-    Expiry, FnEndpoint, Invocation, Iri, Kernel, ReprType, Representation, Request, Space, Thread,
-    Verb,
+    ActionSpec, ArgRef, ArgSpec, Capability, Clock, Description, Endpoint, EndpointSpace, Error,
+    Exact, Expiry, FnEndpoint, Invocation, Iri, Kernel, ReprType, Representation, Request, Space,
+    Thread, Time, Verb,
 };
 use ikigai_throttle::{CircuitBreaker, Failover, Rate, RateLimit, Retry, Throttle, Timeout};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -781,11 +781,19 @@ fn refusals_are_typed_and_never_cached() {
             seen: seen.clone(),
         }),
     ));
-    let kernel = Kernel::new(Arc::new(CircuitBreaker::new(
-        inner,
-        2,
-        Duration::from_millis(30),
-    )));
+    // The cooldown is measured on a clock this test moves, so no real sleep.
+    #[derive(Clone, Default)]
+    struct Manual(Arc<AtomicU64>);
+    impl Clock for Manual {
+        fn now(&self) -> Time {
+            Time::from_millis(self.0.load(Ordering::SeqCst))
+        }
+    }
+    let clock = Manual::default();
+    let kernel = Kernel::new(Arc::new(
+        CircuitBreaker::new(inner, 2, Duration::from_millis(30))
+            .with_clock(Arc::new(clock.clone())),
+    ));
     for _ in 0..2 {
         let err = source(&kernel, "urn:dep", &[]).unwrap_err();
         assert_eq!(err, Error::Unavailable("dependency down".into()));
@@ -801,7 +809,7 @@ fn refusals_are_typed_and_never_cached() {
     );
     assert_eq!(kernel.cache_len(), 0);
     *fail.lock().unwrap() = false;
-    std::thread::sleep(Duration::from_millis(40));
+    clock.0.fetch_add(30, Ordering::SeqCst);
     assert!(
         source(&kernel, "urn:dep", &[]).is_ok(),
         "the half-open probe closed it"
