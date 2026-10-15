@@ -36,8 +36,11 @@ async-lock = "3"
 # an overlay wraps a space it was handed and claims no name of its own. 0.7.0 adds
 # VALIDATE; 0.8.0 adds REQUIRED (a dropped required input must be refused typed),
 # walked here on the mutating `Sink` too, so every overlay is held to passing the
-# wrapped endpoint's `MissingArgument` through unchanged.
-# ⚠ `"0.8.0"` is `>=0.8.0, <0.9.0` under Cargo's 0.x rules: raise it when 0.9 ships.
-# 0.8.0 pulls a newer ikigai-core into every test build; `[dependencies]` above
+# wrapped endpoint's `MissingArgument` through unchanged. 0.8.4 adds RESOLVES
+# (ledger #338): a failed minimal resolution is reported once per action under
+# RESOLVES rather than under the check that needed it, which the over-budget test
+# pins, so 0.8.4 is the true floor.
+# ⚠ `"0.8.4"` is `>=0.8.4, <0.9.0` under Cargo's 0.x rules: raise it when 0.9 ships.
+# 0.8.x pulls a newer ikigai-core into every test build; `[dependencies]` above
 # deliberately stays at the LIBRARY's true minimum (0.1.78), which the caret admits.
-ikigai-conformance = "0.8.0"
+ikigai-conformance = "0.8.4"
