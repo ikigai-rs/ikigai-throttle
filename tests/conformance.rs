@@ -871,12 +871,13 @@ fn an_over_budget_refusal_keeps_the_wrapped_contract() {
     assert_eq!(leaf.gated_reads(), 0);
 }
 
-/// The suite over a zero budget: every read is refused, so the four cacheable
-/// probes report "did not resolve" (attributed to CACHEABLE — conformance PENDING
-/// #33) and nothing else. In particular ENFORCED is clean: the floor precedes the
-/// refusal. Before this arc it was not — the substitute endpoint declared no
-/// `requires`, and `gated` was refused with the rate-limit message instead of
-/// `Denied`.
+/// The suite over a zero budget: every resolution is refused, so each of the five
+/// actions reports once under RESOLVES (conformance 0.8.4, ledger #338) and nothing
+/// else. Before 0.8.4 the same five refusals were attributed to the check that needed
+/// the resolution, four under CACHEABLE and the Sink's under OUTPUTS. In particular
+/// ENFORCED is clean: the floor precedes the refusal. Before this arc it was not: the
+/// substitute endpoint declared no `requires`, and `gated` was refused with the
+/// rate-limit message instead of `Denied`.
 #[test]
 fn over_budget_the_only_findings_are_the_reads_a_refusal_cannot_serve() {
     let kernel = Kernel::new(Arc::new(
@@ -885,31 +886,37 @@ fn over_budget_the_only_findings_are_the_reads_a_refusal_cannot_serve() {
     let report = suite().run_blocking(&kernel);
     eprintln!("over budget: {report}");
     assert_eq!(report.of(Check::Enforced).count(), 0, "{report}");
-    let mut refused: Vec<&str> = report
-        .of(Check::Cacheable)
-        .map(|f| f.endpoint.as_str())
+    let mut refused: Vec<(&str, Option<Verb>)> = report
+        .of(Check::Resolves)
+        .map(|f| (f.endpoint.as_str(), f.verb))
         .collect();
-    refused.sort_unstable();
-    assert_eq!(refused, ["cell", "gated", "live", "upper"], "{report}");
-    for finding in report.of(Check::Cacheable) {
+    refused.sort_unstable_by_key(|(endpoint, verb)| (*endpoint, format!("{verb:?}")));
+    assert_eq!(
+        refused,
+        [
+            ("cell", Some(Verb::Sink)),
+            ("cell", Some(Verb::Source)),
+            ("gated", Some(Verb::Source)),
+            ("live", Some(Verb::Source)),
+            ("upper", Some(Verb::Source)),
+        ],
+        "{report}"
+    );
+    for finding in report.of(Check::Resolves) {
+        // The refusal keeps its kind: a rate-limit refusal is a permanent `Endpoint`.
         assert!(
-            finding.detail.contains("did not resolve") && finding.detail.contains("rate-limited"),
+            finding.detail.contains("did not resolve")
+                && finding.detail.contains("refused as `endpoint`")
+                && finding.detail.contains("rate-limited"),
             "{finding}"
         );
-    }
-    // OUTPUTS (conformance 0.1.1) reaches the Sink the cacheable probe skips, so the
-    // refusal is visible once more, on the one action with a mutating verb. Same cause,
-    // same shape: a read a refusal cannot serve.
-    let refused_outputs: Vec<&str> = report
-        .of(Check::Outputs)
-        .map(|f| f.endpoint.as_str())
-        .collect();
-    assert_eq!(refused_outputs, ["cell"], "{report}");
-    for finding in report.of(Check::Outputs) {
-        assert!(
-            finding.detail.contains("did not resolve") && finding.detail.contains("rate-limited"),
-            "{finding}"
-        );
+        // Each finding names the check that needed the resolution: the cacheable probe
+        // for a Source, OUTPUTS for the Sink the cacheable probe skips.
+        let needed_by = match finding.verb {
+            Some(Verb::Sink) => "Needed by OUTPUTS",
+            _ => "Needed by CACHEABLE",
+        };
+        assert!(finding.detail.contains(needed_by), "{finding}");
     }
     assert_eq!(report.findings.len(), 5, "{report}");
 }
