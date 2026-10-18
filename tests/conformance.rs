@@ -78,11 +78,11 @@
 //!   transient error exactly `attempts` times and then returns the LAST one
 //!   unchanged; a permanent error is returned on the first.
 //! - **Each overlay's own refusal is typed, and never cached**
-//!   ([`refusals_are_typed_and_never_cached`]): an open circuit is a transient
-//!   `Unavailable`; an elapsed budget is a transient `Timeout`; a rate-limit
-//!   refusal is a permanent `Endpoint` carrying a retry hint (pinned as what the
-//!   code does — core has no typed "retry after" error, reported up). None of
-//!   them stores anything.
+//!   ([`refusals_are_typed_and_never_cached`]): an open circuit is a
+//!   `RetryAfter` whose delay is the cooldown left; an elapsed budget is a transient
+//!   `Timeout`; a rate-limit refusal is a `RetryAfter` (no delay on a zero rate,
+//!   which never opens). Both were untyped or transient before core 0.1.108 gave
+//!   them a class (ledger #1546). None of them stores anything.
 //! - **An over-budget refusal keeps the wrapped contract**
 //!   ([`an_over_budget_refusal_keeps_the_wrapped_contract`] and
 //!   [`over_budget_the_only_findings_are_the_reads_a_refusal_cannot_serve`]): the
@@ -118,8 +118,8 @@ use futures::executor::block_on;
 use ikigai_conformance::{Check, Checks, Report, SpaceNaming, Suite};
 use ikigai_core::{
     ActionSpec, ArgRef, ArgSpec, Capability, Clock, Description, Endpoint, EndpointSpace, Error,
-    Exact, Expiry, FnEndpoint, Invocation, Iri, Kernel, ReprType, Representation, Request, Space,
-    Thread, Time, Verb,
+    Exact, Expiry, FailureClass, FnEndpoint, Invocation, Iri, Kernel, ReprType, Representation,
+    Request, Space, Thread, Time, Verb,
 };
 use ikigai_throttle::{CircuitBreaker, Failover, Rate, RateLimit, Retry, Throttle, Timeout};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -653,7 +653,7 @@ impl Endpoint for Failing {
     }
 }
 
-/// Every `Error` variant an endpoint can raise, permanent and transient.
+/// Every `Error` variant an endpoint can raise, one or more of each failure class.
 fn every_error() -> Vec<Error> {
     vec![
         Error::MissingArgument("in".into()),
@@ -666,13 +666,27 @@ fn every_error() -> Vec<Error> {
         Error::NotFound("gone".into()),
         Error::Timeout("slow".into()),
         Error::Unavailable("down".into()),
+        Error::Conflict("taken".into()),
+        // A delay no Retry here waits: none of them has a bound or a deadline.
+        Error::RetryAfter {
+            delay: Some(Duration::from_secs(30)),
+            detail: "limited upstream".into(),
+        },
+        Error::OverBudget {
+            detail: "past 5000 ms".into(),
+        },
+        Error::Refused("origin answered 401".into()),
+        Error::Unsupported {
+            verb: Some(Verb::Sink),
+            detail: "read-only".into(),
+        },
     ]
 }
 
 /// Every variant comes out of every overlay as it went in — same variant, same
 /// message. `Retry` (alone, and inside the stack) re-issues a transient failure
-/// `attempts` times and returns the last unchanged; everything permanent is
-/// returned on the first attempt.
+/// `attempts` times and returns the last unchanged; every other class is returned on
+/// the first attempt (a `RetryAfter` too, here: no `Retry` in this list may wait).
 #[test]
 fn typed_errors_pass_through_unchanged() {
     for (label, compose, retries) in overlays() {
@@ -688,7 +702,11 @@ fn typed_errors_pass_through_unchanged() {
             let kernel = Kernel::new(compose(inner));
             let out = source(&kernel, "urn:failing", &[]).unwrap_err();
             assert_eq!(out, error, "{label}: the error is the wrapped endpoint's");
-            let expected = if error.is_transient() { retries } else { 1 };
+            let expected = if error.class() == FailureClass::Transient {
+                retries
+            } else {
+                1
+            };
             assert_eq!(
                 seen.load(Ordering::SeqCst),
                 expected,
@@ -731,22 +749,20 @@ impl Endpoint for Controlled {
 fn refusals_are_typed_and_never_cached() {
     let root = Capability::root();
 
-    // RateLimit at a zero budget: permanent, carries a retry hint, reaches nothing.
+    // RateLimit at a zero budget: a RetryAfter with no delay (a zero rate never
+    // opens), not transient, reaches nothing.
     let leaf = Leaf::new();
     let kernel = Kernel::new(Arc::new(
         RateLimit::new(leaf.space()).limit("urn:", Rate::new(0, Duration::from_secs(60))),
     ));
     let err = source(&kernel, "urn:cell", &[]).unwrap_err();
-    assert!(matches!(err, Error::Endpoint(_)), "{err:?}");
     assert!(
-        !err.is_transient(),
-        "a rate-limit refusal is permanent: {err:?}"
+        matches!(err, Error::RetryAfter { delay: None, .. }),
+        "{err:?}"
     );
-    let text = err.to_string();
-    assert!(
-        text.contains("rate-limited") && text.contains("retry after"),
-        "{text}"
-    );
+    assert_eq!(err.class(), FailureClass::RetryAfter);
+    assert!(!err.is_transient(), "never an immediate re-issue: {err:?}");
+    assert!(err.to_string().contains("rate-limited"), "{err}");
     assert_eq!(leaf.cell_reads(), 0, "the wrapped endpoint was not reached");
     assert_eq!(kernel.cache_len(), 0, "the refusal stored nothing");
     assert!(!kernel.is_cached(&request(Verb::Source, "urn:cell", &[]), &root));
@@ -770,8 +786,8 @@ fn refusals_are_typed_and_never_cached() {
     assert!(err.to_string().contains("rate-limited"), "{err}");
     assert_eq!(leaf.live_reads(), 0);
 
-    // CircuitBreaker: trip it, then the open circuit is a transient Unavailable
-    // that touches nothing and stores nothing; after the cooldown a probe recovers.
+    // CircuitBreaker: trip it, then the open circuit is a RetryAfter for the cooldown
+    // left that touches nothing and stores nothing; after the cooldown a probe recovers.
     let fail = Arc::new(Mutex::new(true));
     let seen = Arc::new(AtomicU32::new(0));
     let inner: Arc<dyn Space> = Arc::new(EndpointSpace::new().bind_arc(
@@ -799,8 +815,13 @@ fn refusals_are_typed_and_never_cached() {
         assert_eq!(err, Error::Unavailable("dependency down".into()));
     }
     let err = source(&kernel, "urn:dep", &[]).unwrap_err();
-    assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
-    assert!(err.is_transient(), "an open circuit is transient: {err:?}");
+    assert!(matches!(err, Error::RetryAfter { .. }), "{err:?}");
+    assert_eq!(
+        err.retry_after_millis(),
+        Some(30),
+        "the whole cooldown is left"
+    );
+    assert!(!err.is_transient(), "{err:?}");
     assert!(err.to_string().contains("circuit open"), "{err}");
     assert_eq!(
         seen.load(Ordering::SeqCst),
@@ -873,7 +894,7 @@ fn an_over_budget_refusal_keeps_the_wrapped_contract() {
     )
     .unwrap_err();
     assert!(
-        matches!(err, Error::Endpoint(_)) && err.to_string().contains("rate-limited"),
+        matches!(err, Error::RetryAfter { .. }) && err.to_string().contains("rate-limited"),
         "a granted caller meets the limit: {err:?}"
     );
     assert_eq!(leaf.gated_reads(), 0);
@@ -911,10 +932,10 @@ fn over_budget_the_only_findings_are_the_reads_a_refusal_cannot_serve() {
         "{report}"
     );
     for finding in report.of(Check::Resolves) {
-        // The refusal keeps its kind: a rate-limit refusal is a permanent `Endpoint`.
+        // The refusal keeps its kind: a rate-limit refusal is a `retry-after`.
         assert!(
             finding.detail.contains("did not resolve")
-                && finding.detail.contains("refused as `endpoint`")
+                && finding.detail.contains("refused as `retry-after`")
                 && finding.detail.contains("rate-limited"),
             "{finding}"
         );

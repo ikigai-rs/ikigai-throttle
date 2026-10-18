@@ -29,6 +29,17 @@ use ikigai_core::{
 /// synchronous blocking call inside the invoke (e.g. a blocking socket read) never
 /// yields, so a single-threaded executor can't fire the timer; that hang is fixed
 /// at the transport (a socket read timeout), complementary to this.
+///
+/// ★ **Why it stays [`Timeout`](Error::Timeout), class transient, and never
+/// [`OverBudget`](Error::OverBudget)** (ledger #1546, #972): this overlay cannot tell
+/// what ran out. The work it dropped may have been WAITING on something slow (an
+/// upstream, a lock), which a repeat may well beat, or it may have been an expensive
+/// COMPUTATION, which under the same bound costs the same and fails the same. Only the
+/// work itself knows which, so only the work can say `OverBudget`. Calling every
+/// elapse over-budget would stop a [`Retry`](crate::Retry) from riding out a slow
+/// upstream; calling it transient is the reading that was already true. A host that
+/// bounds a computation (a script, a query) should bound it with the computation's own
+/// budget, which can answer `OverBudget`, rather than with this overlay.
 pub struct Timeout<S> {
     inner: S,
     budget: Duration,

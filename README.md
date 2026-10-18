@@ -17,20 +17,45 @@ composable everywhere.
 
 | overlay | what it does |
 | --- | --- |
-| **`RateLimit`** | Reject resolutions over a per-URI-prefix rate (external politeness — a published rate you must not exceed). |
-| **`Retry`** | Re-issue on a *transient* failure, up to N times — but only for an *idempotent* verb (a `Sink` is never blindly re-sent). |
-| **`CircuitBreaker`** | Count consecutive transient failures per target; **trip open** after a threshold and **fail fast** for a cooldown (without touching the dependency), then **half-open** and probe to recover. |
-| **`Failover`** | Try an ordered list `[primary, backup, …]`, advancing on a transient, idempotent failure. |
+| **`RateLimit`** | Refuse resolutions over a per-URI-prefix rate with `RetryAfter`, the time until the window opens (external politeness — a published rate you must not exceed). |
+| **`Retry`** | Re-issue on a *transient* failure, or after a *retry-after* delay that fits the run, up to N times and within the run's retry budget — but only for an *idempotent* verb (a `Sink` is never blindly re-sent). |
+| **`CircuitBreaker`** | Count consecutive transient failures per target; **trip open** after a threshold and **fail fast** with `RetryAfter` for the cooldown left (without touching the dependency), then **half-open** and probe to recover. |
+| **`Failover`** | Try an ordered list `[primary, backup, …]`, advancing on a transient or retry-after failure of an idempotent verb. |
 | **`Timeout`** | Bound an invocation; if the budget elapses, drop the work and return a transient timeout. |
 | **`Throttle`** | Cap *concurrency* per prefix and **park** the excess until a slot frees (backpressure, never an error) — Nygard's Bulkhead. |
 
-Two things every overlay reads:
+Three things every re-issuing overlay reads, all from core (none of them is a table
+of this crate's):
 
-- **the verb** — Source / Exists / Meta / Delete are idempotent, so `Retry` and
-  `Failover` may re-issue them; a non-idempotent `Sink` is never re-sent (that
-  needs an idempotency key, not a blind retry);
-- **`Error::is_transient`** — timeouts and unavailability are worth retrying;
-  a denial, a not-found, or a bad argument is permanent and returns immediately.
+- **the verb** — `Verb::is_idempotent`: Source / Exists / Meta / Delete are
+  idempotent, so `Retry` and `Failover` may re-issue them; a non-idempotent `Sink` is
+  never re-sent (that needs an idempotency key, not a blind retry);
+- **the failure's class** — `Error::class()`, which says who may repeat a failure
+  and when:
+
+  | class received | `Retry` | `Failover` | `CircuitBreaker` |
+  | --- | --- | --- | --- |
+  | transient (`Timeout`, `Unavailable`) | re-issue | advance to the next target | counts toward tripping |
+  | retry-after (`RetryAfter`) | wait the delay and re-issue, only when it fits | advance (another target is not limited) | not counted |
+  | over-budget, denied, refused, permanent, unknown | returned unchanged | returned unchanged | not counted |
+
+  A retry-after delay *fits* when it is at most the run's time left (a door set a
+  deadline: `Invocation::time_left`), lowered by `Retry::with_max_wait` when that is
+  set; with no deadline, `with_max_wait` alone is the bound, and unset it waits for
+  nothing. The wait is on a `Timer` (`Retry::with_timer`; futures-timer by default
+  on a native target, none on wasm32, where every `RetryAfter` is returned to the
+  caller). An over-budget failure is never repeated by anything (under the same
+  bound it costs the same and fails the same);
+- **the run's retry budget** — when the host configured one
+  (`Kernel::with_retry_budget`, ceilings granted as `urn:cap:retry:<n>`), every
+  re-issue and every failover advance spends from ONE pool shared by the whole
+  resolution tree, so nested `Retry` layers cannot multiply their attempts; with the
+  pool spent, an overlay returns the error it received. `attempts` still caps each
+  `Retry` layer. A kernel with no retry budget keeps each overlay's own `attempts`.
+
+`Timeout` stays a transient `Timeout`: it cannot tell a wait on something slow (a
+repeat may beat it) from an expensive computation (a repeat costs the same), so only
+the work itself can say `OverBudget`.
 
 ## Transparent to identity
 
@@ -105,8 +130,7 @@ use std::time::Duration;
 use std::sync::Arc;
 
 // Bound each attempt, ride out blips on the primary, give up on it once it's a
-// corpse, and fail over to a backup — every layer reading the same transient/
-// permanent distinction.
+// corpse, and fail over to a backup — every layer reading the same failure class.
 let primary = CircuitBreaker::new(
     Retry::new(Timeout::new(primary_space, Duration::from_secs(2)), 3),
     5,                          // trip after 5 consecutive transient failures
@@ -142,9 +166,14 @@ Longest-prefix wins; an unmatched target is never rate-limited; `Meta`
 may not invoke. The overlay is transparent to enumeration, so the catalog/manifold
 sees the wrapped bindings unchanged.
 
-Over budget, a resolution lands on a stand-in that refuses on invoke with a
-permanent `Error::Endpoint` carrying the retry hint (a transient error would have a
-`Retry` above re-issue straight into the limit). The stand-in **describes itself as
+Over budget, a resolution lands on a stand-in that refuses on invoke with
+`Error::RetryAfter`, whose delay is the time until the window next opens (since
+0.2.0; it was a permanent `Error::Endpoint` with the delay only in its text). An HTTP
+edge answers it with 429 and `Retry-After`; a `Retry` above waits it out when the
+delay fits the run, never re-issuing straight into the limit. A `Rate::new(0, …)`
+prefix never opens, so its refusal carries no delay. The stand-in re-checks the
+window when it is invoked, so a waited retry that finds the window open is admitted
+(and charged). The stand-in **describes itself as
 the wrapped endpoint**, so the kernel's capability floor holds whatever the budget
 says: a caller with no grant for a gated resource is still `Denied`, and never
 learns the prefix is limited. Two consequences of the limit acting at resolution,
@@ -160,7 +189,8 @@ budget: 3 exec calls / 10s
   call 1: (ran)
   call 2: (ran)
   call 3: (ran)
-  call 4: BLOCKED — rate-limited: `urn:system:exec` is capped at 3/10s — retry after 10s
+  call 4: BLOCKED — retry after 10000 ms: rate-limited: `urn:system:exec` is capped at 3 per 10s
+  call 5: BLOCKED — retry after 10000 ms: rate-limited: `urn:system:exec` is capped at 3 per 10s
 ```
 
 The motivating use is a standing server (a dev server, a background dreamer, a
@@ -179,9 +209,12 @@ wrapped endpoint's thread and cut by a `Sink` through the overlay, a live read s
 live, a pure read caches with no thread; every typed `Error` an endpoint raises
 comes out of every overlay unchanged (`Retry` re-issues a transient one `attempts`
 times and returns the last); each overlay's own refusal is typed as its semantics
-say (open circuit: transient `Unavailable`; elapsed budget: transient `Timeout`;
-rate limit: permanent `Endpoint` with a retry hint) and none of them is ever
-cached. `REQUIRED` runs on the `Sink` too, and a negative control (endpoints that
+say (open circuit: `RetryAfter` for the cooldown left; elapsed budget: transient
+`Timeout`; rate limit: `RetryAfter` until the window opens) and none of them is ever
+cached. `tests/failure_classes.rs` holds every failure class against `Retry`,
+`Failover` and `CircuitBreaker`, the shared retry pool across nested layers, a
+retry-after delay longer than the run's time left (not waited), and an over-budget
+failure (never re-issued, ledger #972). `REQUIRED` runs on the `Sink` too, and a negative control (endpoints that
 ignore a required input or refuse its absence untyped) is found through every
 overlay exactly as it is bare.
 

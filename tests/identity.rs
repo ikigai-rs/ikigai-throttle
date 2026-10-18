@@ -97,7 +97,7 @@ fn failover_resolves_to_one_wrapper() {
 }
 
 /// The over-budget stand-in is an identity too: a caller hammering a limited
-/// prefix resolves the same refusal, and it still refuses with a live retry hint.
+/// prefix resolves the same refusal, and it still refuses as a rate limit.
 #[test]
 fn rate_limits_stand_in_resolves_to_one_wrapper() {
     let overlay = RateLimit::new(leaf()).limit("urn:demo:", Rate::new(0, Duration::from_secs(60)));
@@ -110,7 +110,10 @@ fn rate_limits_stand_in_resolves_to_one_wrapper() {
     ))
     .unwrap_err();
     assert!(format!("{err}").contains("rate-limited"), "{err}");
-    assert!(format!("{err}").contains("retry after"), "{err}");
+    assert!(
+        matches!(err, ikigai_core::Error::RetryAfter { .. }),
+        "{err:?}"
+    );
 }
 
 /// A stack is stable at every layer, so the outermost wrapper is too.
