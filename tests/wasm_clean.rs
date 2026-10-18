@@ -1,4 +1,4 @@
-//! The library reads no platform time outside its two native-only modules
+//! The library reads no platform time outside its native-only modules
 //! (ledger #1507).
 //!
 //! On wasm32-unknown-unknown, `Instant::now()`, `SystemTime::now()`, a spawned
@@ -7,8 +7,9 @@
 //! governor: it would build green and panic on the first governed call in a
 //! browser. This guard is the check that can. Time belongs to a core `Clock`
 //! (`with_clock`); the platform is read only in `native_clock` (the native
-//! default) and `timeout` (a timer, which a clock cannot be), and both are declared
-//! behind `cfg(not(target_arch = "wasm32"))`.
+//! default clock), `native_timer` (the native default timer a `Retry` waits a
+//! `RetryAfter` on) and `timeout` (a timer, which a clock cannot be), and all three
+//! are declared behind `cfg(not(target_arch = "wasm32"))`.
 //!
 //! Comment lines are skipped, so prose and doctests (which run natively) may name
 //! these; the `#[cfg(test)]` module at the end of a file is skipped for the same
@@ -17,7 +18,7 @@
 use std::path::Path;
 
 /// Modules that may read the platform, each declared native-only in `lib.rs`.
-const NATIVE_ONLY: [&str; 2] = ["native_clock", "timeout"];
+const NATIVE_ONLY: [&str; 3] = ["native_clock", "native_timer", "timeout"];
 
 /// What compiles on wasm32 and fails there at runtime.
 const PLATFORM_TIME: [&str; 5] = [

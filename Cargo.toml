@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-throttle"
-description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue transient idempotent failures), CircuitBreaker (trip open on a failing dependency), Failover (try [primary, backup, ...] on transient failure), Timeout (bound an invocation, transient on elapse), Throttle (cap concurrency, park the excess); logging & load-balancing later."
+description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue idempotent failures by their failure class, from the run's shared budget), CircuitBreaker (trip open on a failing dependency), Failover (try [primary, backup, ...] on a transient or retry-after failure), Timeout (bound an invocation, transient on elapse), Throttle (cap concurrency, park the excess); logging & load-balancing later."
 version = "0.1.11"
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -11,14 +11,16 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 # Wraps ANY Space. Builds for wasm32-unknown-unknown (CI's `wasm32 lib clippy`):
 # RateLimit and CircuitBreaker read time from a core Clock (`with_clock`; on wasm32
 # the host must install one, ledger #1507) and never from the platform. Timeout is
-# native only, see below. Clock and Time are far older than the 0.1.78 floor.
-ikigai-core = "0.1.78" # Space::topology + Space::id (every single-space
-                      # overlay forwards both, ledger #978);
-                      # Resolution::map_endpoint (an overlay must forward
-                      # what the inner resolution reported, not rebuild it);
-                      # Error::is_transient (Retry gates on it);
-                      # Invocation::with_bindings (each Failover candidate is
-                      # invoked on the captures ITS OWN grammar took)
+# native only, see below. Clock and Time are far older than the floor.
+# 0.1.108 is the floor (ledger #1546, #200): Error::class + FailureClass (every
+# re-issuing overlay decides from the class it RECEIVED), Error::RetryAfter (what
+# RateLimit and an open CircuitBreaker answer), Verb::is_idempotent, and the run's
+# shared retry pool and deadline (Invocation::retry_budget, RetryBudget::try_spend,
+# Invocation::time_left). Older, still used: Space::topology + Space::id (ledger
+# #978), Resolution::map_endpoint, Invocation::with_bindings (each Failover
+# candidate is invoked on the captures ITS OWN grammar took).
+# ⚠ Under 0.x caret rules "0.1.108" is >=0.1.108, <0.2.0.
+ikigai-core = "0.1.108"
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
 # Throttle parks the excess on a fair async Semaphore (runtime-agnostic).
@@ -49,6 +51,6 @@ futures-timer = "3"
 # RESOLVES rather than under the check that needed it, which the over-budget test
 # pins, so 0.8.4 is the true floor.
 # ⚠ `"0.8.4"` is `>=0.8.4, <0.9.0` under Cargo's 0.x rules: raise it when 0.9 ships.
-# 0.8.x pulls a newer ikigai-core into every test build; `[dependencies]` above
-# deliberately stays at the LIBRARY's true minimum (0.1.78), which the caret admits.
+# 0.8.4 asks for ikigai-core 0.1.100; `[dependencies]` above states the library's own
+# true minimum (0.1.108), which is higher, so tests build against it.
 ikigai-conformance = "0.8.4"

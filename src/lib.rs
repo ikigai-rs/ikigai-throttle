@@ -10,12 +10,14 @@
 //!
 //! - [`RateLimit`] — reject resolutions over a per-URI-prefix rate (external
 //!   politeness: a published rate you must not exceed).
-//! - [`Retry`] — re-issue on a *transient* failure, up to N times, for an
-//!   *idempotent* verb only (a `Sink` is never blindly re-sent).
+//! - [`Retry`] — re-issue on a *transient* failure, or after a *retry-after* delay
+//!   that fits the run, up to N times, for an *idempotent* verb only (a `Sink` is
+//!   never blindly re-sent).
 //! - [`CircuitBreaker`] — trip open after consecutive transient failures and fail
-//!   fast for a cooldown, then half-open and probe to recover.
-//! - [`Failover`] — try `[primary, backup, …]`, advancing on a transient,
-//!   idempotent failure.
+//!   fast (retry-after the cooldown left) for a cooldown, then half-open and probe to
+//!   recover.
+//! - [`Failover`] — try `[primary, backup, …]`, advancing on a transient or
+//!   retry-after failure of an idempotent verb.
 //! - [`Timeout`] — bound an invocation; on elapse, drop the work and return a
 //!   transient timeout.
 //! - [`Throttle`] — cap *concurrency* per prefix and **park** the excess until a
@@ -49,9 +51,24 @@
 //! [`Timeout`] needs a timer, which a clock cannot be, so it is native only; every
 //! other overlay here builds for wasm32 unchanged.
 //!
-//! The reliability overlays read the request **verb** (idempotency governs whether
-//! a re-issue is *safe*) and [`Error::is_transient`](ikigai_core::Error::is_transient)
-//! (whether it's *worth* retrying). Logging, egress-filtering, and load-balancing
+//! The reliability overlays read the request **verb**
+//! ([`Verb::is_idempotent`](ikigai_core::Verb::is_idempotent) governs whether a re-issue
+//! is *safe*) and the failure's [**class**](ikigai_core::Error::class) (whether it is
+//! *worth* repeating, and when). They decide from core's
+//! [`FailureClass`], never from a table of their own (ledger
+//! #1546, #200):
+//!
+//! | class received | [`Retry`] | [`Failover`] | [`CircuitBreaker`] |
+//! | --- | --- | --- | --- |
+//! | transient | re-issue, idempotent verbs only | advance to the next target | counts toward tripping |
+//! | retry-after | wait the delay and re-issue, only when it fits | advance (another target is not limited) | not counted |
+//! | over-budget, denied, refused, permanent, unknown | returned unchanged | returned unchanged | not counted |
+//!
+//! A re-issue or an advance spends one retry from the run's shared pool
+//! ([`Invocation::retry_budget`](ikigai_core::Invocation::retry_budget)) when the host
+//! configured one, and with none left the overlay returns the error it received: the
+//! budget belongs to whoever issued the request, not to the overlay. A kernel with no
+//! retry budget keeps each overlay's own `attempts`. Logging, egress-filtering, and load-balancing
 //! overlays are later additions of the same shape. The motivating use is a standing
 //! server (a dev server, a background dreamer, a red-team agent) where a runaway or
 //! buggy agent must not hammer `urn:system:exec` or a remote API through the
@@ -74,16 +91,21 @@ use std::time::Duration;
 mod memo;
 use memo::{address, digest, Encloses, Wrappers};
 
+mod timer;
+pub use timer::Timer;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native_clock;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_timer;
 #[cfg(not(target_arch = "wasm32"))]
 mod timeout;
 #[cfg(not(target_arch = "wasm32"))]
 pub use timeout::Timeout;
 
 use ikigai_core::{
-    Bindings, Clock, Description, Endpoint, Error, Invocation, Iri, Representation, Request,
-    Resolution, Resolved, Scope, Space, SpaceEntry, Time, Topology, Verb,
+    Bindings, Clock, Description, Endpoint, Error, FailureClass, Invocation, Iri, Representation,
+    Request, Resolution, Resolved, Scope, Space, SpaceEntry, Time, Topology, Verb,
 };
 use std::sync::Arc;
 
@@ -111,6 +133,25 @@ fn elapsed(now: Time, since: Time) -> u64 {
     now.as_millis().saturating_sub(since.as_millis())
 }
 
+/// Drop the hits in `window` that are a whole `rate.window` old or older at `now`.
+fn slide(window: &mut VecDeque<Time>, now: Time, rate: Rate) {
+    while window
+        .front()
+        .is_some_and(|&t| elapsed(now, t) >= millis(rate.window))
+    {
+        window.pop_front();
+    }
+}
+
+/// A duration as an operator wrote it: whole seconds from a second up, else milliseconds.
+fn span(duration: Duration) -> String {
+    if duration >= Duration::from_secs(1) && duration.subsec_millis() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
+}
+
 /// A velocity cap: at most `max` resolutions per `window`.
 #[derive(Clone, Copy, Debug)]
 pub struct Rate {
@@ -130,6 +171,37 @@ impl Rate {
 /// A [`Space`] overlay that rate-limits resolutions by URI prefix. Wrap any
 /// space, then `limit` one or more prefixes. Longest-prefix wins; an unmatched
 /// target is never limited.
+///
+/// A resolution over budget is refused with [`Error::RetryAfter`] (since 0.2.0,
+/// ledger #1546, #200), whose delay is the time until the window next opens, so an
+/// HTTP edge answers 429 with `Retry-After`:
+///
+/// ```
+/// use std::{sync::Arc, time::Duration};
+/// use futures::executor::block_on;
+/// use ikigai_core::{Capability, EndpointSpace, Error, Exact, FailureClass, FixedClock,
+///     FnEndpoint, Iri, Kernel, ReprType, Representation, Request, Verb};
+/// use ikigai_throttle::{Rate, RateLimit};
+///
+/// let ok = FnEndpoint::new("x", |_| Ok(Representation::new(ReprType::new("text/plain"), b"ok".to_vec())));
+/// let kernel = Kernel::new(Arc::new(
+///     RateLimit::new(EndpointSpace::new().bind(Exact::new("urn:demo:x"), ok))
+///         .limit("urn:demo:", Rate::new(1, Duration::from_secs(10)))
+///         .with_clock(Arc::new(FixedClock::at(1_000))),
+/// ));
+/// let read = || block_on(kernel.issue(
+///     Request::new(Verb::Source, Iri::parse("urn:demo:x").unwrap()),
+///     &Capability::root(),
+/// ));
+/// assert!(read().is_ok());
+/// let limited = read().unwrap_err();
+/// assert_eq!(limited.class(), FailureClass::RetryAfter);
+/// assert_eq!(limited.retry_after_millis(), Some(10_000));
+/// assert_eq!(
+///     limited.to_string(),
+///     "retry after 10000 ms: rate-limited: `urn:demo:` is capped at 1 per 10s",
+/// );
+/// ```
 pub struct RateLimit<S> {
     inner: S,
     rules: Vec<(String, Rate)>,
@@ -235,13 +307,7 @@ impl<S: Space> Space for RateLimit<S> {
         let mut hits = self.hits.lock().expect("throttle lock");
         let window = hits.entry(prefix.clone()).or_default();
         if let Some(now) = now {
-            // Drop timestamps older than the window.
-            while window
-                .front()
-                .is_some_and(|&t| elapsed(now, t) >= millis(rate.window))
-            {
-                window.pop_front();
-            }
+            slide(window, now, *rate);
         }
         if now.is_none() || window.len() as u32 >= rate.max {
             drop(hits);
@@ -308,14 +374,23 @@ impl<S: Space> Space for RateLimit<S> {
 /// exists to withhold, and the catalog's contract and the kernel's enforcement
 /// disagreed for the length of the window. `ikigai-conformance`'s ENFORCED check
 /// found it (`tests/conformance.rs`). Forwarding the description keeps declared =
-/// enforced whatever the budget says; the refusal itself is unchanged.
+/// enforced whatever the budget says.
 ///
-/// The refusal is a permanent [`Error::Endpoint`] carrying the retry hint: core
-/// has no typed "retry after" error, and a transient one would have a `Retry`
-/// above re-issue into the limit immediately, which is the opposite of the
-/// politeness the limit exists for. The hint is computed when the stand-in
-/// refuses, from the window as it is then, because one stand-in serves every
-/// over-budget resolution of its endpoint (ledger #534).
+/// ★ **The refusal is [`Error::RetryAfter`]** (since 0.2.0, ledger #1546, #200), with
+/// the time to the window's next opening as its delay, so an HTTP edge answers 429 with
+/// `Retry-After` and a [`Retry`] above waits instead of re-issuing straight into the
+/// limit. It used to be a permanent [`Error::Endpoint`] with the delay only in prose,
+/// because core had no typed "retry after". A `Rate::new(0, …)` prefix is never
+/// allowed, so no window opening exists to name: its refusal carries no delay
+/// (`delay: None`, "not now"), which no retry overlay waits on.
+///
+/// The decision at resolution is provisional. The stand-in **re-checks the window when
+/// it is invoked**, and if the window has opened since (a [`Retry`] above waited the
+/// delay out, and re-invokes the endpoint it resolved, which is this stand-in), it
+/// charges the window and invokes the wrapped endpoint. Without that, a waited retry
+/// would meet the same refusal however long it waited. The delay is computed then,
+/// from the window as it is, because one stand-in serves every over-budget resolution
+/// of its endpoint (ledger #534).
 struct RateLimited {
     inner: Arc<dyn Endpoint>,
     prefix: String,
@@ -326,21 +401,25 @@ struct RateLimited {
 }
 
 impl RateLimited {
-    /// How long until the OLDEST hit in the window ages out — unless there is no
-    /// oldest hit. `Rate::new(0, …)` reads as "never allowed", a plausible
-    /// operator input, and it is over budget on an EMPTY window: unwrapping the
-    /// front there panicked on the first resolve instead of refusing. A governor
-    /// must refuse, never panic, so fall back to the whole window.
-    fn retry_after(&self, now: Time) -> Duration {
-        let hits = self.hits.lock().expect("throttle lock");
-        hits.get(&self.prefix)
-            .and_then(|window| window.front())
-            .map(|&t| {
-                self.rate
-                    .window
-                    .saturating_sub(Duration::from_millis(elapsed(now, t)))
-            })
-            .unwrap_or(self.rate.window)
+    /// Admit this call if the window has room at `now`, charging it; otherwise the
+    /// time until the OLDEST hit in the window ages out, which is when it next opens.
+    /// `None` when it never opens: `Rate::new(0, …)` reads as "never allowed", a
+    /// plausible operator input, and it is over budget on an EMPTY window. (Unwrapping
+    /// the front there once panicked on the first resolve instead of refusing; a
+    /// governor must refuse, never panic.)
+    fn admit(&self, now: Time) -> Result<(), Option<Duration>> {
+        let mut hits = self.hits.lock().expect("throttle lock");
+        let window = hits.entry(self.prefix.clone()).or_default();
+        slide(window, now, self.rate);
+        if (window.len() as u32) < self.rate.max {
+            window.push_back(now);
+            return Ok(());
+        }
+        Err(window.front().map(|&t| {
+            self.rate
+                .window
+                .saturating_sub(Duration::from_millis(elapsed(now, t)))
+        }))
     }
 }
 
@@ -352,7 +431,7 @@ impl Encloses for RateLimited {
 
 #[async_trait::async_trait]
 impl Endpoint for RateLimited {
-    async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation, Error> {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
         let Some(clock) = &self.clock else {
             return Err(Error::Endpoint(format!(
                 "rate-limited: `{}` has no clock to measure its window — \
@@ -360,13 +439,19 @@ impl Endpoint for RateLimited {
                 self.prefix
             )));
         };
-        Err(Error::Endpoint(format!(
-            "rate-limited: `{}` is capped at {}/{}s — retry after {}s",
-            self.prefix,
-            self.rate.max,
-            self.rate.window.as_secs().max(1),
-            self.retry_after(clock.now()).as_secs() + 1
-        )))
+        match self.admit(clock.now()) {
+            // The window opened since resolution: this call is within budget now.
+            Ok(()) => self.inner.invoke(inv).await,
+            Err(delay) => Err(Error::RetryAfter {
+                delay,
+                detail: format!(
+                    "rate-limited: `{}` is capped at {} per {}",
+                    self.prefix,
+                    self.rate.max,
+                    span(self.rate.window)
+                ),
+            }),
+        }
     }
 
     fn name(&self) -> &str {
@@ -378,16 +463,63 @@ impl Endpoint for RateLimited {
     }
 }
 
-/// A [`Space`] overlay that **re-issues** a resolution on a transient failure. It
-/// wraps any space; a resolved endpoint is re-invoked up to `attempts` times while
-/// the error [`is_transient`](Error::is_transient) **and** the request verb is
-/// idempotent (Source/Exists/Meta/Delete). A non-idempotent `Sink` is never retried
-/// — a blind re-send could double-write; that needs an idempotency key. Permanent
-/// errors (denied, not-found, bad-argument) return immediately. Nygard's stability
-/// family; sibling of [`RateLimit`] (and of the coming CircuitBreaker/Failover).
+/// A [`Space`] overlay that **re-issues** a failed invocation when the failure's
+/// [class](Error::class) says a repeat may succeed, for an
+/// [idempotent](Verb::is_idempotent) verb only: a `Sink` is never blindly re-sent (a
+/// re-send could double-write; that needs an idempotency key). Nygard's stability
+/// family; sibling of [`RateLimit`], [`CircuitBreaker`] and [`Failover`].
+///
+/// What it does with each [`FailureClass`] it RECEIVES:
+///
+/// - **transient** ([`Timeout`](Error::Timeout), [`Unavailable`](Error::Unavailable)):
+///   re-issue at once.
+/// - **retry-after** ([`RetryAfter`](Error::RetryAfter)): wait the delay on its
+///   [`Timer`] and re-issue, but only when the delay is known and fits: at most the
+///   run's [`time_left`](Invocation::time_left) when the door set a deadline, and at
+///   most this overlay's own bound ([`with_max_wait`](Self::with_max_wait)) otherwise.
+///   An own bound never extends a deadline. A delay that does not fit is returned
+///   unchanged, so the caller, who owns the time, decides; with no deadline and no
+///   bound set, that is every `RetryAfter`.
+/// - **over-budget, denied, refused, permanent, unknown**: returned on the first
+///   attempt. Over-budget especially (ledger #972): under the same bound a repeat costs
+///   the same and fails the same.
+///
+/// **The budget is the run's, not the overlay's** (ledger #1546). When the host
+/// configured a retry budget, the run carries one shared pool
+/// ([`Invocation::retry_budget`]); this overlay spends one retry from it before every
+/// re-issue, and returns the error it received when none is left, so nested `Retry`
+/// layers spend one pool instead of multiplying their attempts. `attempts` then caps
+/// this layer under the pool. With no pool (a kernel that configured none), `attempts`
+/// alone bounds it, as before.
+///
+/// ```
+/// use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
+/// use futures::executor::block_on;
+/// use ikigai_core::{Capability, EndpointSpace, Error, Exact, FnEndpoint, Iri, Kernel, Request, Verb};
+/// use ikigai_throttle::Retry;
+///
+/// let seen = Arc::new(AtomicU32::new(0));
+/// let counter = seen.clone();
+/// let busy = FnEndpoint::new("busy", move |_| {
+///     counter.fetch_add(1, Ordering::SeqCst);
+///     Err(Error::Unavailable("busy".into()))
+/// });
+/// let leaf = EndpointSpace::new().bind(Exact::new("urn:busy"), busy);
+/// let read = Request::new(Verb::Source, Iri::parse("urn:busy").unwrap());
+///
+/// // Two Retry layers of 3 attempts each, under a run allowed 2 retries in all:
+/// // one first try plus two re-issues, never 3 x 3.
+/// let kernel = Kernel::new(Arc::new(Retry::new(Retry::new(leaf, 3), 3))).with_retry_budget(0, 2);
+/// assert!(block_on(kernel.issue(read, &Capability::root())).is_err());
+/// assert_eq!(seen.load(Ordering::SeqCst), 3);
+/// ```
 pub struct Retry<S> {
     inner: S,
     attempts: u32,
+    /// What a `RetryAfter` delay is waited out on: see [`with_timer`](Self::with_timer).
+    timer: Option<Arc<dyn Timer>>,
+    /// The longest delay waited when the run has no deadline.
+    max_wait: Option<Duration>,
     /// One wrapper per inner endpoint: see [`memo`].
     wrappers: Wrappers<usize, RetryEndpoint>,
 }
@@ -399,19 +531,44 @@ impl<S: Space> Retry<S> {
         Retry {
             inner,
             attempts: attempts.max(1),
+            timer: timer::default_timer(),
+            max_wait: None,
             wrappers: Wrappers::new(),
         }
+    }
+
+    /// Wait out [`RetryAfter`](Error::RetryAfter) delays on `timer` (builder), instead
+    /// of the default: futures-timer on a native target, and **none on wasm32**, where
+    /// a `Retry` without a timer returns every `RetryAfter` unchanged. A test hands it a
+    /// timer that moves the test's clock. Call it before the first resolution: a wrapper
+    /// built by then keeps the timer it was built with.
+    pub fn with_timer(mut self, timer: Arc<dyn Timer>) -> Self {
+        self.timer = Some(timer);
+        self
+    }
+
+    /// The longest [`RetryAfter`](Error::RetryAfter) delay this overlay waits (builder).
+    /// It is the whole bound when the run has no deadline, and it only lowers one that
+    /// does. Unset, a run with no deadline waits for nothing. Call it before the first
+    /// resolution, as [`with_timer`](Self::with_timer).
+    pub fn with_max_wait(mut self, max_wait: Duration) -> Self {
+        self.max_wait = Some(max_wait);
+        self
     }
 }
 
 impl<S: Space> Space for Retry<S> {
     fn resolve(&self, request: &Request, scope: &Scope) -> Resolution {
-        let attempts = self.attempts;
         self.inner.resolve(request, scope).map_endpoint(|inner| {
             self.wrappers.get_or_wrap(
                 address(&inner),
                 |_| true,
-                || RetryEndpoint { inner, attempts },
+                || RetryEndpoint {
+                    inner,
+                    attempts: self.attempts,
+                    timer: self.timer.clone(),
+                    max_wait: self.max_wait,
+                },
             ) as Arc<dyn Endpoint>
         })
     }
@@ -429,11 +586,65 @@ impl<S: Space> Space for Retry<S> {
     }
 }
 
+/// When a failure may be repeated, by the class core gives it.
+enum Repeat {
+    /// Re-issue now (transient).
+    Now,
+    /// Re-issue after this delay (retry-after, with a known delay).
+    After(Duration),
+    /// Return it (every other class, and retry-after with no delay).
+    Never,
+}
+
+/// What a re-issuing overlay may do with `error` on `verb`: decided from core's
+/// [`Error::class`] and [`Verb::is_idempotent`], never from a table of this crate's.
+fn repeat(error: &Error, verb: Verb) -> Repeat {
+    if !verb.is_idempotent() {
+        return Repeat::Never;
+    }
+    match (error.class(), error) {
+        (FailureClass::Transient, _) => Repeat::Now,
+        (
+            FailureClass::RetryAfter,
+            Error::RetryAfter {
+                delay: Some(delay), ..
+            },
+        ) => Repeat::After(*delay),
+        _ => Repeat::Never,
+    }
+}
+
+/// Spend one retry from the run's pool, when the run carries one. `true` with no pool:
+/// the overlay's own bound (`attempts`, or the candidate list) is then the whole bound.
+fn spend(inv: &Invocation<'_>) -> bool {
+    inv.retry_budget().is_none_or(|pool| pool.try_spend())
+}
+
 /// The endpoint a [`Retry`] resolves to: re-invoke the inner endpoint while the
-/// failure is transient and the verb idempotent.
+/// failure's class allows it, the verb is idempotent and the budget has a retry.
 struct RetryEndpoint {
     inner: Arc<dyn Endpoint>,
     attempts: u32,
+    timer: Option<Arc<dyn Timer>>,
+    max_wait: Option<Duration>,
+}
+
+impl RetryEndpoint {
+    /// Whether a `RetryAfter` delay is one this overlay may wait out for this run: the
+    /// run's time left when it has a deadline (lowered by an own bound), the own bound
+    /// when it has none, and never without a timer to wait on.
+    fn fits(&self, delay: Duration, inv: &Invocation<'_>) -> bool {
+        if self.timer.is_none() {
+            return false;
+        }
+        let bound = match (inv.time_left(), self.max_wait) {
+            (Some(left), Some(own)) => left.min(own),
+            (Some(left), None) => left,
+            (None, Some(own)) => own,
+            (None, None) => Duration::ZERO,
+        };
+        delay <= bound
+    }
 }
 
 impl Encloses for RetryEndpoint {
@@ -445,19 +656,28 @@ impl Encloses for RetryEndpoint {
 #[async_trait::async_trait]
 impl Endpoint for RetryEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
-        let idempotent = matches!(
-            inv.request.verb,
-            Verb::Source | Verb::Exists | Verb::Meta | Verb::Delete
-        );
         let mut attempt = 1;
         loop {
-            match self.inner.invoke(inv).await {
+            let error = match self.inner.invoke(inv).await {
                 Ok(representation) => return Ok(representation),
-                Err(e) if e.is_transient() && idempotent && attempt < self.attempts => {
-                    attempt += 1;
-                }
-                Err(e) => return Err(e),
+                Err(error) => error,
+            };
+            if attempt >= self.attempts {
+                return Err(error);
             }
+            let wait = match repeat(&error, inv.request.verb) {
+                Repeat::Now => None,
+                Repeat::After(delay) if self.fits(delay, inv) => Some(delay),
+                Repeat::After(_) | Repeat::Never => return Err(error),
+            };
+            // Spend BEFORE waiting, so an empty pool never costs a wait.
+            if !spend(inv) {
+                return Err(error);
+            }
+            if let (Some(delay), Some(timer)) = (wait, &self.timer) {
+                timer.sleep(delay).await;
+            }
+            attempt += 1;
         }
     }
 
@@ -480,14 +700,43 @@ struct Breaker {
 }
 
 /// A [`Space`] overlay implementing Nygard's **Circuit Breaker** (from *Release
-/// It!*). It counts consecutive transient failures per target; after `threshold`
-/// it **trips open** and, for `cooldown`, fails fast — returning an
-/// [`Unavailable`](Error::Unavailable) error *without touching the dependency*, so
-/// a dead resource stops being hammered. Once `cooldown` elapses it goes
-/// **half-open**: the next call probes the dependency — success **closes** the
-/// circuit, another failure **re-opens** it. Only *transient* failures count;
-/// permanent ones (denied, not-found) pass through untouched. Sibling of
-/// [`RateLimit`] and [`Retry`]; its trip-open is the fast trigger a Failover reads.
+/// It!*). It counts consecutive **transient** failures per target (class
+/// [`Transient`](ikigai_core::FailureClass::Transient)); after `threshold` it **trips
+/// open** and, for `cooldown`, fails fast *without touching the dependency*, so a dead
+/// resource stops being hammered. Once `cooldown` elapses it goes **half-open**: the
+/// next call probes the dependency — success **closes** the circuit, another failure
+/// **re-opens** it. Every other class passes through uncounted: a `RetryAfter` says the
+/// dependency is limited, not broken, and over-budget, denied, refused, permanent and
+/// unknown failures say nothing about its health. Sibling of [`RateLimit`] and
+/// [`Retry`]; its trip-open is the fast trigger a Failover reads.
+///
+/// ★ **The open circuit answers [`Error::RetryAfter`]** (since 0.2.0, ledger #1546),
+/// with the cooldown left as its delay: a [`Retry`] above waits it out (when it fits
+/// the run's time) instead of spending its attempts on a circuit it cannot close, a
+/// [`Failover`] above moves to the next target, and an HTTP edge answers 429 with
+/// `Retry-After`. It used to be a transient [`Unavailable`](Error::Unavailable).
+///
+/// ```
+/// use std::{sync::Arc, time::Duration};
+/// use futures::executor::block_on;
+/// use ikigai_core::{Capability, EndpointSpace, Error, Exact, FixedClock, FnEndpoint, Iri,
+///     Kernel, Request, Verb};
+/// use ikigai_throttle::CircuitBreaker;
+///
+/// let down = FnEndpoint::new("down", |_| Err(Error::Unavailable("down".into())));
+/// let kernel = Kernel::new(Arc::new(
+///     CircuitBreaker::new(EndpointSpace::new().bind(Exact::new("urn:dep"), down), 1, Duration::from_secs(30))
+///         .with_clock(Arc::new(FixedClock::at(1_000))),
+/// ));
+/// let read = || block_on(kernel.issue(
+///     Request::new(Verb::Source, Iri::parse("urn:dep").unwrap()),
+///     &Capability::root(),
+/// ));
+/// assert_eq!(read().unwrap_err(), Error::Unavailable("down".into()), "trips the circuit");
+/// let open = read().unwrap_err();
+/// assert_eq!(open.retry_after_millis(), Some(30_000), "the cooldown left");
+/// assert_eq!(open.to_string(), "retry after 30000 ms: circuit open for `urn:dep`");
+/// ```
 pub struct CircuitBreaker<S> {
     inner: S,
     threshold: u32,
@@ -594,11 +843,12 @@ impl Endpoint for BreakerEndpoint {
             let mut states = self.states.lock().expect("breaker lock");
             let breaker = states.entry(self.target.clone()).or_default();
             if let Some(opened) = breaker.opened_at {
-                if elapsed(clock.now(), opened) < millis(self.cooldown) {
-                    return Err(Error::Unavailable(format!(
-                        "circuit open for `{}` — failing fast until it cools down",
-                        self.target
-                    )));
+                let cooled = elapsed(clock.now(), opened);
+                if cooled < millis(self.cooldown) {
+                    return Err(Error::RetryAfter {
+                        delay: Some(self.cooldown.saturating_sub(Duration::from_millis(cooled))),
+                        detail: format!("circuit open for `{}`", self.target),
+                    });
                 }
                 // Cooldown elapsed → let this call through as a half-open probe.
             }
@@ -613,13 +863,13 @@ impl Endpoint for BreakerEndpoint {
                 breaker.failures = 0;
                 breaker.opened_at = None;
             }
-            Err(e) if e.is_transient() => {
+            Err(e) if e.class() == FailureClass::Transient => {
                 breaker.failures += 1;
                 if breaker.failures >= self.threshold {
                     breaker.opened_at = Some(clock.now()); // trip, or re-open a failed probe
                 }
             }
-            Err(_) => {} // permanent errors don't count toward tripping
+            Err(_) => {} // no other class says the dependency is broken
         }
         outcome
     }
@@ -635,13 +885,21 @@ impl Endpoint for BreakerEndpoint {
 
 /// A [`Space`] overlay that **fails over** across an ordered list of spaces
 /// `[primary, backup, …]`. It resolves the request against each, then on invoke
-/// tries them in order — advancing to the next only while the error
-/// [`is_transient`](Error::is_transient) **and** the verb is idempotent
-/// (Source/Exists/Meta/Delete), since failing a non-idempotent `Sink` over to
-/// another node could double-apply it. A permanent error stops immediately (a
-/// backup would answer the same). The DR ladder's core; wrap a primary in a
-/// [`CircuitBreaker`] and its trip-open becomes the *fast* trigger to move on.
-/// Sibling of [`Retry`] — Retry re-issues to the *same* target, Failover to the *next*.
+/// tries them in order — advancing to the next only while the failure's
+/// [class](Error::class) is **transient** or **retry-after** (this target is down, or
+/// limited; another one is neither) **and** the verb is
+/// [idempotent](Verb::is_idempotent), since failing a non-idempotent `Sink` over to
+/// another node could double-apply it. Every other class stops immediately: a backup
+/// would answer an over-budget, denied, refused, permanent or unknown failure the same
+/// (an over-budget input costs the same anywhere, ledger #972). The DR ladder's core;
+/// wrap a primary in a [`CircuitBreaker`] and its trip-open becomes the *fast* trigger
+/// to move on. Sibling of [`Retry`] — Retry re-issues to the *same* target, Failover to
+/// the *next*.
+///
+/// An advance is a re-issue, so when the run carries a retry pool
+/// ([`Invocation::retry_budget`]) each one spends a retry from it, and with none left
+/// the failover returns the error it received. With no pool the candidate list alone
+/// bounds it.
 ///
 /// Each candidate is invoked on the variables **its own** grammar captured, so
 /// targets bound under different patterns (`urn:x/{id}` beside `urn:x/{name}`) are
@@ -780,8 +1038,19 @@ impl Space for Failover {
     }
 }
 
+/// Whether a [`Failover`] moves past a target that failed with `error` on `verb`: a
+/// transient or retry-after class, for an idempotent verb. A retry-after advances
+/// whatever its delay, since the delay is THIS target's.
+fn advances(error: &Error, verb: Verb) -> bool {
+    verb.is_idempotent()
+        && matches!(
+            error.class(),
+            FailureClass::Transient | FailureClass::RetryAfter
+        )
+}
+
 /// The endpoint a [`Failover`] resolves to: try each target in order, advancing on
-/// a transient, idempotent failure.
+/// a transient or retry-after failure of an idempotent verb.
 struct FailoverEndpoint {
     candidates: Vec<Candidate>,
 }
@@ -804,10 +1073,6 @@ struct Candidate {
 #[async_trait::async_trait]
 impl Endpoint for FailoverEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
-        let idempotent = matches!(
-            inv.request.verb,
-            Verb::Source | Verb::Exists | Verb::Meta | Verb::Delete
-        );
         let last = self.candidates.len().saturating_sub(1);
         let mut latest = None;
         for (i, candidate) in self.candidates.iter().enumerate() {
@@ -828,8 +1093,13 @@ impl Endpoint for FailoverEndpoint {
             let attempt = inv.with_bindings(&candidate.bindings);
             match candidate.endpoint.invoke(&attempt).await {
                 Ok(representation) => return Ok(representation),
-                Err(e) if e.is_transient() && idempotent && i < last => {
-                    latest = Some(e); // this target is down — try the next
+                Err(e) if i < last && advances(&e, inv.request.verb) => {
+                    // This target is down or limited: try the next, if the run can
+                    // afford another issue.
+                    if !spend(inv) {
+                        return Err(e);
+                    }
+                    latest = Some(e);
                 }
                 Err(e) => return Err(e),
             }
@@ -1427,8 +1697,12 @@ mod tests {
             assert!(tick(&kernel).is_ok(), "call {i} should pass");
         }
         let err = tick(&kernel).unwrap_err();
-        assert!(format!("{err:?}").contains("rate-limited"), "{err:?}");
-        assert!(format!("{err:?}").contains("retry after"), "{err:?}");
+        assert!(
+            matches!(err, Error::RetryAfter { delay: Some(_), .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("rate-limited"), "{err}");
+        assert!(err.to_string().starts_with("retry after"), "{err}");
     }
 
     /// A governor must REFUSE, never panic. `Rate::new(0, …)` — "never allowed"
