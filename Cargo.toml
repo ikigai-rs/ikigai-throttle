@@ -50,7 +50,11 @@ futures-timer = "3"
 # (ledger #338): a failed minimal resolution is reported once per action under
 # RESOLVES rather than under the check that needed it, which the over-budget test
 # pins, so 0.8.4 is the true floor.
-# ⚠ `"0.8.4"` is `>=0.8.4, <0.9.0` under Cargo's 0.x rules: raise it when 0.9 ships.
-# 0.8.4 asks for ikigai-core 0.1.100; `[dependencies]` above states the library's own
-# true minimum (0.1.108), which is higher, so tests build against it.
-ikigai-conformance = "0.8.4"
+# 0.9.0 adds core 0.1.105's contract-shape checks (REQUIRED probes input groups,
+# OUTPUTS honors output_from, PIPELINE's named-only line, VALIDATE refuses a default
+# on a binding) and RECOMPUTE; 0.10.0 adds FAILURES, OFF unless a suite opts in
+# (`Suite::check_failures()`, not turned on here).
+# ⚠ `"0.10.0"` is `>=0.10.0, <0.11.0` under Cargo's 0.x rules: raise it when 0.11 ships.
+# Conformance's own floor is ikigai-core 0.1.108, which `[dependencies]` above already
+# states as the library's true minimum, so tests build against it.
+ikigai-conformance = "0.10.0"
