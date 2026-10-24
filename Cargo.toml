@@ -38,6 +38,11 @@ oxrdf = "0.3.0"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 futures-timer = "3"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# oxrdf also supports random blank-node IDs and pulls in getrandom through rand.
+# We only serialize literals, but that dependency still needs a wasm backend to build.
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
 [dev-dependencies]
 # The module recipe as one test (`tests/conformance.rs`). This crate binds no
 # endpoint of its own — an overlay decorates whatever it wraps — so the suite
