@@ -41,7 +41,7 @@
 <https://ikigai-rs.dev/ns/throttle> a owl:Ontology ;
     rdfs:label "ikigai-throttle vocabulary" ;
     rdfs:comment "The terms of ikigai-throttle's state face (urn:throttle:state): the board, the governors observed on it, the keys each governor holds state for, and a failover's candidate spaces. Embedded in the ikigai-throttle crate as VOCABULARY_TTL." ;
-    owl:versionInfo "0.2.0" .
+    owl:versionInfo "0.2.1" .
 
 # ═══════════════════════════════════════════════════════════════════════════
 # The board and the governors
