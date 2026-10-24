@@ -1,20 +1,20 @@
 //! [`Timeout`]: bound an invocation by a timer.
 //!
-//! **Native only.** A timeout needs something that WAKES a future when the budget
-//! elapses, and that is not a clock: core's [`Clock`](ikigai_core::Clock) answers
-//! "what time is it", never "tell me when". This module races the work against
-//! `futures_timer::Delay`, whose native backend reads `Instant::now()` and runs a
-//! helper thread; wasm32-unknown-unknown has neither a platform clock nor threads,
-//! and both compile there and fail only at runtime, which `cargo check` cannot see.
-//! So on wasm32 the module is not compiled and
-//! `Timeout` does not exist: a host that names it gets a compile error, never a
-//! panic on the first governed call. A wasm `Timeout` needs a timer the host
-//! supplies, which core has no seam for yet (ledger #1507).
+//! A timeout needs something that WAKES a future when the budget elapses, and that is
+//! not a clock: core's [`Clock`](ikigai_core::Clock) answers "what time is it", never
+//! "tell me when". So the overlay races the work against a [`Timer`], injected like a
+//! clock (ledger #2189): a native target defaults to futures-timer, and on
+//! wasm32-unknown-unknown the HOST supplies one. A browser has timers (`setTimeout`), but
+//! this library cannot reach them without JavaScript imports, and the same target also
+//! runs where there is no JavaScript at all (wasmtime). A `Timeout` there without a timer
+//! refuses what it governs, naming [`with_timer`](Timeout::with_timer): never a panic, and
+//! never an unbounded call passed off as a bounded one.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::memo::{address, digest, Encloses, Wrappers};
+use crate::timer::{self, Timer};
 use ikigai_core::{
     Description, Endpoint, Error, Invocation, Iri, Representation, Request, Resolution, Scope,
     Space, SpaceEntry, Topology,
@@ -43,6 +43,8 @@ use ikigai_core::{
 pub struct Timeout<S> {
     inner: S,
     budget: Duration,
+    /// What the budget is raced against: see [`with_timer`](Self::with_timer).
+    timer: Option<Arc<dyn Timer>>,
     /// One wrapper per (inner endpoint, target), since a wrapper names its target
     /// when the budget elapses: see [`memo`](crate::memo).
     wrappers: Wrappers<(usize, u64), TimeoutEndpoint>,
@@ -54,8 +56,40 @@ impl<S: Space> Timeout<S> {
         Timeout {
             inner,
             budget,
+            timer: timer::default_timer(),
             wrappers: Wrappers::new(),
         }
+    }
+
+    /// Race the budget against `timer` (builder), instead of the default: futures-timer on
+    /// a native target, and **none on wasm32**, where a `Timeout` without a timer refuses
+    /// what it governs. A browser host hands it a timer over `setTimeout`; a test hands it
+    /// one that fires when the test says. Call it before the first resolution: a wrapper
+    /// built by then keeps the timer it was built with.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use ikigai_core::{EndpointSpace, Kernel};
+    /// use ikigai_throttle::{Timeout, Timer};
+    ///
+    /// /// A timer that never fires: the work always finishes first.
+    /// struct Never;
+    ///
+    /// #[async_trait::async_trait]
+    /// impl Timer for Never {
+    ///     async fn sleep(&self, _delay: Duration) {
+    ///         futures::future::pending::<()>().await
+    ///     }
+    /// }
+    ///
+    /// let space = Timeout::new(EndpointSpace::new(), Duration::from_secs(5))
+    ///     .with_timer(Arc::new(Never));
+    /// let _kernel = Kernel::new(Arc::new(space));
+    /// ```
+    pub fn with_timer(mut self, timer: Arc<dyn Timer>) -> Self {
+        self.timer = Some(timer);
+        self
     }
 }
 
@@ -70,6 +104,7 @@ impl<S: Space> Space for Timeout<S> {
                     inner,
                     target: target.to_string(),
                     budget: self.budget,
+                    timer: self.timer.clone(),
                 },
             ) as Arc<dyn Endpoint>
         })
@@ -93,6 +128,7 @@ struct TimeoutEndpoint {
     inner: Arc<dyn Endpoint>,
     target: String,
     budget: Duration,
+    timer: Option<Arc<dyn Timer>>,
 }
 
 impl Encloses for TimeoutEndpoint {
@@ -104,9 +140,18 @@ impl Encloses for TimeoutEndpoint {
 #[async_trait::async_trait]
 impl Endpoint for TimeoutEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+        // No timer, no bound: refuse before the work starts rather than run it unbounded.
+        let Some(timer) = &self.timer else {
+            return Err(Error::Endpoint(format!(
+                "timeout: `{}` has no timer to bound it — install one with Timeout::with_timer",
+                self.target
+            )));
+        };
         let work = self.inner.invoke(inv);
+        let elapse = timer.sleep(self.budget);
         futures::pin_mut!(work);
-        match futures::future::select(work, futures_timer::Delay::new(self.budget)).await {
+        futures::pin_mut!(elapse);
+        match futures::future::select(work, elapse).await {
             // The work finished within budget.
             futures::future::Either::Left((result, _timer)) => result,
             // The timer won — drop the in-flight work and report a transient timeout.
@@ -124,5 +169,115 @@ impl Endpoint for TimeoutEndpoint {
 
     fn describe(&self) -> Description {
         self.inner.describe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::executor::block_on;
+    use ikigai_core::{
+        AsyncFnEndpoint, Capability, EndpointSpace, Exact, InvokeFuture, Kernel, ReprType, Verb,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Mutex;
+
+    /// A timer the test controls: it fires at once or never, and records each budget.
+    struct Scripted {
+        fires: bool,
+        asked: Mutex<Vec<Duration>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Timer for Scripted {
+        async fn sleep(&self, delay: Duration) {
+            self.asked.lock().unwrap().push(delay);
+            if !self.fires {
+                futures::future::pending::<()>().await
+            }
+        }
+    }
+
+    fn scripted(fires: bool) -> Arc<Scripted> {
+        Arc::new(Scripted {
+            fires,
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// An endpoint that answers once `release` is set, and counts its invocations.
+    fn gated(release: Arc<AtomicBool>, seen: Arc<AtomicU32>) -> AsyncFnEndpoint {
+        AsyncFnEndpoint::new("gated", move |_inv| -> InvokeFuture<'_> {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let release = release.clone();
+            Box::pin(async move {
+                if !release.load(Ordering::SeqCst) {
+                    futures::future::pending::<()>().await;
+                }
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"done".to_vec(),
+                ))
+            })
+        })
+    }
+
+    fn call(kernel: &Kernel) -> Result<Representation, Error> {
+        block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse("urn:dep").unwrap()),
+            &Capability::root(),
+        ))
+    }
+
+    /// The injected timer decides: when it fires first, the work is dropped and the
+    /// answer is a transient Timeout naming the target, raced against exactly the budget.
+    #[test]
+    fn an_injected_timer_that_fires_first_times_the_work_out() {
+        let seen = Arc::new(AtomicU32::new(0));
+        let space = EndpointSpace::new().bind(
+            Exact::new("urn:dep"),
+            gated(Arc::new(AtomicBool::new(false)), seen.clone()),
+        );
+        let timer = scripted(true);
+        let kernel = Kernel::new(Arc::new(
+            Timeout::new(space, Duration::from_millis(250)).with_timer(timer.clone()),
+        ));
+        let err = call(&kernel).unwrap_err();
+        assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+        assert!(err.to_string().contains("urn:dep"), "{err}");
+        assert_eq!(*timer.asked.lock().unwrap(), [Duration::from_millis(250)]);
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    /// Work that finishes while the timer has not fired is answered unchanged.
+    #[test]
+    fn work_that_finishes_first_is_answered() {
+        let space = EndpointSpace::new().bind(
+            Exact::new("urn:dep"),
+            gated(Arc::new(AtomicBool::new(true)), Arc::default()),
+        );
+        let kernel = Kernel::new(Arc::new(
+            Timeout::new(space, Duration::from_millis(250)).with_timer(scripted(false)),
+        ));
+        assert_eq!(call(&kernel).unwrap().bytes, b"done");
+    }
+
+    /// With no timer (wasm32 when the host installed none) a timeout cannot bound the
+    /// work, so it REFUSES before starting it and says how to fix it: never a panic, and
+    /// never the work run unbounded under a name that promises a bound.
+    #[test]
+    fn a_timeout_without_a_timer_refuses_and_names_the_fix() {
+        let seen = Arc::new(AtomicU32::new(0));
+        let space = EndpointSpace::new().bind(
+            Exact::new("urn:dep"),
+            gated(Arc::new(AtomicBool::new(true)), seen.clone()),
+        );
+        let mut timeout = Timeout::new(space, Duration::from_millis(250));
+        timeout.timer = None; // what `new` leaves on wasm32
+        let kernel = Kernel::new(Arc::new(timeout));
+        let err = call(&kernel).unwrap_err();
+        assert!(matches!(err, Error::Endpoint(_)), "{err:?}");
+        assert!(err.to_string().contains("Timeout::with_timer"), "{err}");
+        assert_eq!(seen.load(Ordering::SeqCst), 0, "the work never started");
     }
 }

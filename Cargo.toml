@@ -10,8 +10,9 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 [dependencies]
 # Wraps ANY Space. Builds for wasm32-unknown-unknown (CI's `wasm32 lib clippy`):
 # RateLimit and CircuitBreaker read time from a core Clock (`with_clock`; on wasm32
-# the host must install one, ledger #1507) and never from the platform. Timeout is
-# native only, see below. Clock and Time are far older than the floor.
+# the host must install one, ledger #1507) and never from the platform; Timeout and
+# Retry wait on a Timer the host injects there (`with_timer`, ledger #2189). Clock and
+# Time are far older than the floor.
 # 0.1.108 is the floor (ledger #1546, #200): Error::class + FailureClass (every
 # re-issuing overlay decides from the class it RECEIVED), Error::RetryAfter (what
 # RateLimit and an open CircuitBreaker answer), Verb::is_idempotent, and the run's
@@ -25,15 +26,14 @@ ikigai-core = "0.1.108"
 async-trait = "0.1"
 # Throttle parks the excess on a fair async Semaphore (runtime-agnostic).
 async-lock = "3"
-
-# Timeout races the invoke against a timer: `select` (futures) + a runtime-agnostic
-# timer (futures-timer works under the kernel's `block_on`, no tokio). NATIVE ONLY:
-# futures-timer's native backend reads `Instant::now()` and runs a helper thread,
-# which compile on wasm32 and fail there at runtime, so Timeout and both crates are
-# left out of a wasm32 build
-# (src/timeout.rs says what a wasm Timeout would need).
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Timeout races the invoke against its Timer with `select`, which builds anywhere.
 futures = "0.3"
+
+# The default Timer on a native target: a runtime-agnostic timer (futures-timer works
+# under the kernel's `block_on`, no tokio). NATIVE ONLY: its native backend reads
+# `Instant::now()` and runs a helper thread, which compile on wasm32 and fail there at
+# runtime, so on wasm32 the host injects a Timer instead (ledger #2189).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 futures-timer = "3"
 
 [dev-dependencies]
