@@ -144,6 +144,56 @@ let resilient = Failover::new(vec![Arc::new(primary), Arc::new(backup_space)]);
 it's dead and fails fast; that trip-open is the instant trigger for `Failover` to
 move to the backup.
 
+## Observable state
+
+What the governors hold is readable as resources, in a space of its own that the
+host mounts **beside** the governed one, so the overlays stay transparent:
+
+```rust
+use ikigai_throttle::{CircuitBreaker, StateBoard};
+
+let board = StateBoard::new();
+let guarded = CircuitBreaker::new(inner, 5, Duration::from_secs(30))
+    .observed(&board, "upstream")?;           // urn:throttle:state:upstream
+let root = Fallback::new(vec![Arc::new(board.space()), Arc::new(guarded)]);
+let kernel = Arc::new(Kernel::new(Arc::new(root)));
+board.attach(&kernel);                        // answers become cacheable
+```
+
+| name | what it answers |
+| --- | --- |
+| `urn:throttle:state` | every governor the caller may read |
+| `urn:throttle:state:{governor}` | one governor and its keys |
+| `urn:throttle:state:{governor}:key:{key}` | one prefix's window or bulkhead, one target's circuit or failover route |
+| `urn:throttle:state:{governor}:candidate:{n}` | a failover's `n`th space |
+
+Each answers `text/plain` and `as=text/turtle` (the `thr:` vocabulary,
+`https://ikigai-rs.dev/ns/throttle#`, skolemized, no blank nodes). A governor names
+the space it governs by the `id()` it forwards (`thr:governs`), which is the IRI
+`urn:kernel:topology` gives that node, so a diagram joins the state to the
+arrangement it already draws. `RateLimit` shows each prefix's hits in the window,
+`CircuitBreaker` each failed target's circuit (closed, open, half-open) and its
+failure count, `Throttle` the work running and parked per prefix, `Failover` the
+candidate each target's last call ended at. `Retry` and `Timeout` hold state for one
+call only and have no face.
+
+Reading a governor needs `urn:cap:throttle:state:{governor}`; every name declares the
+family `urn:cap:throttle:state:*`. A caller with no grant under it is refused by the
+kernel's floor the same way for every name, registered or not, and a governor the
+caller may not read is `NotFound` exactly as one that does not exist: this is the
+information the rate-limit floor once leaked (ledger #14), so its existence is not
+disclosed either.
+
+Without `attach` every answer is live. With it, an answer is cacheable and hangs from
+the governor's thread `urn:throttle:governor:{governor}`, which the governor cuts on
+each change its face shows; a change time alone makes (a hit ageing out, a cooldown
+running out) sets the answer's deadline instead, so give the governors the kernel's
+clock. A governor cuts only when its face was read since the last cut, so observing
+costs an unread governor one atomic swap per change. Measured on one machine
+(release, `cargo test --release --test state measure -- --ignored --nocapture`): a
+four-governor board read costs about 15 µs live and 0.8 µs from the cache; a governed
+call costs the same observed or not (0.8 µs); a cut costs about 0.2 µs.
+
 ## RateLimit
 
 ```rust

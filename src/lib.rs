@@ -51,6 +51,15 @@
 //! [`Timeout`] needs a timer, which a clock cannot be, so it is native only; every
 //! other overlay here builds for wasm32 unchanged.
 //!
+//! **What the governors hold is readable, beside them.** A host observes a governor onto a
+//! [`StateBoard`] (`observed(&board, "name")`) and mounts [`StateBoard::space`] next to
+//! the governed space: `urn:throttle:state` then serves the windows, circuits, bulkheads
+//! and failover routes as `text/plain` and Turtle, skolemized per governor and key, each
+//! governor naming the space it governs by the [`Space::id`] it forwards. Reading it
+//! needs `urn:cap:throttle:state:{governor}`, and a governor the caller may not read is
+//! not found. The overlays themselves are unchanged: still transparent to identity,
+//! enumeration and topology. See [`StateBoard`] and the `state` module's docs.
+//!
 //! The reliability overlays read the request **verb**
 //! ([`Verb::is_idempotent`](ikigai_core::Verb::is_idempotent) governs whether a re-issue
 //! is *safe*) and the failure's [**class**](ikigai_core::Error::class) (whether it is
@@ -85,6 +94,7 @@
 //! ```
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -93,6 +103,12 @@ use memo::{address, digest, Encloses, Wrappers};
 
 mod timer;
 pub use timer::Timer;
+
+mod state;
+pub use state::{
+    governor_iri, governor_thread, state_cap, StateBoard, STATE, STATE_CAP_FAMILY, STATE_NS,
+};
+use state::{Circuit, Key, Kind, Observed, Reading, Watch};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native_clock;
@@ -123,7 +139,7 @@ fn default_clock() -> Option<Arc<dyn Clock>> {
 }
 
 /// A duration in whole milliseconds, the resolution of a core [`Time`].
-fn millis(duration: Duration) -> u64 {
+pub(crate) fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -144,7 +160,7 @@ fn slide(window: &mut VecDeque<Time>, now: Time, rate: Rate) {
 }
 
 /// A duration as an operator wrote it: whole seconds from a second up, else milliseconds.
-fn span(duration: Duration) -> String {
+pub(crate) fn span(duration: Duration) -> String {
     if duration >= Duration::from_secs(1) && duration.subsec_millis() == 0 {
         format!("{}s", duration.as_secs())
     } else {
@@ -212,6 +228,8 @@ pub struct RateLimit<S> {
     clock: Option<Arc<dyn Clock>>,
     /// One stand-in per (wrapped endpoint, limited prefix): see [`memo`].
     stand_ins: Wrappers<(usize, String), RateLimited>,
+    /// How a charged hit reaches the state face: see [`observed`](Self::observed).
+    watch: Arc<Watch>,
 }
 
 impl<S: Space> RateLimit<S> {
@@ -223,7 +241,26 @@ impl<S: Space> RateLimit<S> {
             hits: Arc::new(Mutex::new(HashMap::new())),
             clock: default_clock(),
             stand_ins: Wrappers::new(),
+            watch: Watch::new(),
         }
+    }
+
+    /// Serve this governor's windows on `board` as `name` (builder), at
+    /// `urn:throttle:state:{name}`: one key per limited prefix, with its hits in the
+    /// window. See [`StateBoard`]. Refused for a name that is not lowercase letters,
+    /// digits and `-`, one already on the board, or a governor already observed.
+    pub fn observed(self, board: &StateBoard, name: &str) -> Result<Self, Error> {
+        state::observe(board, name, &self.watch, self.view())?;
+        Ok(self)
+    }
+
+    fn view(&self) -> Arc<dyn Observed> {
+        Arc::new(RateLimitView {
+            governs: self.inner.id(),
+            rules: self.rules.clone(),
+            hits: Arc::clone(&self.hits),
+            clock: self.clock.clone(),
+        })
     }
 
     /// Measure the window on `clock` (builder), instead of the default: a monotonic
@@ -267,6 +304,7 @@ impl<S: Space> RateLimit<S> {
     /// ```
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = Some(clock);
+        self.watch.refresh(self.view());
         self
     }
 
@@ -277,6 +315,7 @@ impl<S: Space> RateLimit<S> {
         // Longest prefix first, so `rule_for` takes the most specific match.
         self.rules
             .sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
+        self.watch.refresh(self.view());
         self
     }
 
@@ -328,6 +367,7 @@ impl<S: Space> Space for RateLimit<S> {
                     rate: *rate,
                     hits: Arc::clone(&self.hits),
                     clock: self.clock.clone(),
+                    watch: Arc::clone(&self.watch),
                 },
             );
             return Resolution::Hit(hit.with_endpoint(stand_in));
@@ -335,6 +375,9 @@ impl<S: Space> Space for RateLimit<S> {
         if let Some(now) = now {
             window.push_back(now);
         }
+        drop(hits);
+        // A hit charged: the window's count changed (after the lock, see `Watch`).
+        self.watch.changed();
         Resolution::Hit(hit)
     }
 
@@ -398,6 +441,8 @@ struct RateLimited {
     hits: Arc<Mutex<HashMap<String, VecDeque<Time>>>>,
     /// The governor's clock; `None` is the refusal for having none.
     clock: Option<Arc<dyn Clock>>,
+    /// The governor's: a hit charged here changes its window too.
+    watch: Arc<Watch>,
 }
 
 impl RateLimited {
@@ -441,7 +486,10 @@ impl Endpoint for RateLimited {
         };
         match self.admit(clock.now()) {
             // The window opened since resolution: this call is within budget now.
-            Ok(()) => self.inner.invoke(inv).await,
+            Ok(()) => {
+                self.watch.changed();
+                self.inner.invoke(inv).await
+            }
             Err(delay) => Err(Error::RetryAfter {
                 delay,
                 detail: format!(
@@ -747,6 +795,8 @@ pub struct CircuitBreaker<S> {
     /// One wrapper per (inner endpoint, target), since a wrapper carries the
     /// target its circuit is keyed on: see [`memo`].
     wrappers: Wrappers<(usize, u64), BreakerEndpoint>,
+    /// How a circuit's change reaches the state face: see [`observed`](Self::observed).
+    watch: Arc<Watch>,
 }
 
 impl<S: Space> CircuitBreaker<S> {
@@ -760,7 +810,28 @@ impl<S: Space> CircuitBreaker<S> {
             states: Arc::new(Mutex::new(HashMap::new())),
             clock: default_clock(),
             wrappers: Wrappers::new(),
+            watch: Watch::new(),
         }
+    }
+
+    /// Serve this governor's circuits on `board` as `name` (builder), at
+    /// `urn:throttle:state:{name}`: one key per target that has failed through it, with
+    /// its state (closed, open, half-open) and its count of consecutive transient
+    /// failures. A target that never failed has no key: its circuit is closed. See
+    /// [`StateBoard`]; refused as [`RateLimit::observed`] is.
+    pub fn observed(self, board: &StateBoard, name: &str) -> Result<Self, Error> {
+        state::observe(board, name, &self.watch, self.view())?;
+        Ok(self)
+    }
+
+    fn view(&self) -> Arc<dyn Observed> {
+        Arc::new(BreakerView {
+            governs: self.inner.id(),
+            threshold: self.threshold,
+            cooldown: self.cooldown,
+            states: Arc::clone(&self.states),
+            clock: self.clock.clone(),
+        })
     }
 
     /// Measure the cooldown on `clock` (builder), instead of the default: a
@@ -774,6 +845,7 @@ impl<S: Space> CircuitBreaker<S> {
     /// it was built with.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = Some(clock);
+        self.watch.refresh(self.view());
         self
     }
 }
@@ -792,6 +864,7 @@ impl<S: Space> Space for CircuitBreaker<S> {
                     cooldown: self.cooldown,
                     states: Arc::clone(&self.states),
                     clock: self.clock.clone(),
+                    watch: Arc::clone(&self.watch),
                 },
             ) as Arc<dyn Endpoint>
         })
@@ -819,6 +892,7 @@ struct BreakerEndpoint {
     cooldown: Duration,
     states: Arc<Mutex<HashMap<String, Breaker>>>,
     clock: Option<Arc<dyn Clock>>,
+    watch: Arc<Watch>,
 }
 
 impl Encloses for BreakerEndpoint {
@@ -839,10 +913,12 @@ impl Endpoint for BreakerEndpoint {
             )));
         };
         // Gate: if open and still cooling, fail fast without touching the dependency.
+        // A target with no entry is closed; reading it never creates one, so the state
+        // face lists only targets that have failed (a closed circuit with no history is
+        // what an absent key means).
         {
-            let mut states = self.states.lock().expect("breaker lock");
-            let breaker = states.entry(self.target.clone()).or_default();
-            if let Some(opened) = breaker.opened_at {
+            let states = self.states.lock().expect("breaker lock");
+            if let Some(opened) = states.get(&self.target).and_then(|b| b.opened_at) {
                 let cooled = elapsed(clock.now(), opened);
                 if cooled < millis(self.cooldown) {
                     return Err(Error::RetryAfter {
@@ -856,20 +932,29 @@ impl Endpoint for BreakerEndpoint {
         // Invoke (closed, or a half-open probe), then update the circuit.
         let outcome = self.inner.invoke(inv).await;
         let mut states = self.states.lock().expect("breaker lock");
-        let breaker = states.entry(self.target.clone()).or_default();
-        match &outcome {
-            Ok(_) => {
+        let changed = match &outcome {
+            Ok(_) => match states.get_mut(&self.target) {
                 // Success closes the circuit (and confirms a probe).
-                breaker.failures = 0;
-                breaker.opened_at = None;
-            }
+                Some(breaker) if breaker.failures != 0 || breaker.opened_at.is_some() => {
+                    breaker.failures = 0;
+                    breaker.opened_at = None;
+                    true
+                }
+                _ => false, // already closed: nothing changed
+            },
             Err(e) if e.class() == FailureClass::Transient => {
-                breaker.failures += 1;
+                let breaker = states.entry(self.target.clone()).or_default();
+                breaker.failures = breaker.failures.saturating_add(1);
                 if breaker.failures >= self.threshold {
                     breaker.opened_at = Some(clock.now()); // trip, or re-open a failed probe
                 }
+                true
             }
-            Err(_) => {} // no other class says the dependency is broken
+            Err(_) => false, // no other class says the dependency is broken
+        };
+        drop(states);
+        if changed {
+            self.watch.changed();
         }
         outcome
     }
@@ -909,6 +994,18 @@ pub struct Failover {
     /// One wrapper per (candidate endpoints, target), checked against each
     /// candidate's captures on reuse: see [`memo`].
     wrappers: Wrappers<(Vec<usize>, u64), FailoverEndpoint>,
+    /// Per target, where its last call ended: kept only once observed.
+    routes: Arc<Mutex<HashMap<String, Route>>>,
+    /// How a route's change reaches the state face: see [`observed`](Self::observed).
+    watch: Arc<Watch>,
+}
+
+/// Where a [`Failover`]'s last call to one target ended: the index of the space (into
+/// the list it was built with) whose candidate answered or returned the error.
+#[derive(Clone, Copy, PartialEq)]
+struct Route {
+    space: usize,
+    answered: bool,
 }
 
 impl Failover {
@@ -917,7 +1014,23 @@ impl Failover {
         Failover {
             spaces,
             wrappers: Wrappers::new(),
+            routes: Arc::new(Mutex::new(HashMap::new())),
+            watch: Watch::new(),
         }
+    }
+
+    /// Serve this failover on `board` as `name` (builder), at
+    /// `urn:throttle:state:{name}`: its spaces in order (each named by its own
+    /// [`Space::id`]), and one key per target called through it since, naming the space
+    /// its last call ended at and whether that one answered. See [`StateBoard`]; refused
+    /// as [`RateLimit::observed`] is.
+    pub fn observed(self, board: &StateBoard, name: &str) -> Result<Self, Error> {
+        let view = Arc::new(FailoverView {
+            candidates: self.spaces.iter().map(|space| space.id()).collect(),
+            routes: Arc::clone(&self.routes),
+        });
+        state::observe(board, name, &self.watch, view)?;
+        Ok(self)
     }
 }
 
@@ -927,9 +1040,12 @@ impl Space for Failover {
         // local ForwardingEndpoint, no round-trip); the wire calls happen on invoke,
         // and only as far down the list as failures force.
         let mut hits: Vec<Resolved> = Vec::new();
-        for space in &self.spaces {
+        // Which space each hit came from, for the state face's routes.
+        let mut from: Vec<usize> = Vec::new();
+        for (index, space) in self.spaces.iter().enumerate() {
             if let Resolution::Hit(hit) = space.resolve(request, scope) {
                 hits.push(hit);
+                from.push(index);
             }
         }
         let Some(first) = hits.first() else {
@@ -955,21 +1071,28 @@ impl Space for Failover {
             hits.iter().map(|hit| address(&hit.endpoint)).collect(),
             digest(request.target.as_str()),
         );
+        let target = request.target.as_str();
         let fits = |wrapper: &FailoverEndpoint| {
-            wrapper
-                .candidates
-                .iter()
-                .zip(&hits)
-                .all(|(candidate, hit)| candidate.bindings == hit.bindings)
+            wrapper.target == target
+                && wrapper.candidates.iter().zip(hits.iter().zip(&from)).all(
+                    |(candidate, (hit, space))| {
+                        candidate.bindings == hit.bindings && candidate.space == *space
+                    },
+                )
         };
         let failover = self.wrappers.get_or_wrap(key, fits, || FailoverEndpoint {
             candidates: hits
                 .iter()
-                .map(|hit| Candidate {
+                .zip(&from)
+                .map(|(hit, space)| Candidate {
                     endpoint: Arc::clone(&hit.endpoint),
                     bindings: hit.bindings.clone(),
+                    space: *space,
                 })
                 .collect(),
+            target: target.to_string(),
+            routes: Arc::clone(&self.routes),
+            watch: Arc::clone(&self.watch),
         });
 
         // ★ THE CANONICAL: report it only when every hit agrees, otherwise none.
@@ -1053,6 +1176,32 @@ fn advances(error: &Error, verb: Verb) -> bool {
 /// a transient or retry-after failure of an idempotent verb.
 struct FailoverEndpoint {
     candidates: Vec<Candidate>,
+    /// The target every candidate resolved, which the routes are keyed on.
+    target: String,
+    routes: Arc<Mutex<HashMap<String, Route>>>,
+    watch: Arc<Watch>,
+}
+
+impl FailoverEndpoint {
+    /// Record where this call ended, when a host observes the failover, and cut the
+    /// state face only when that differs from where the last one did.
+    fn ended(&self, at: &Candidate, answered: bool) {
+        if !self.watch.is_observed() {
+            return;
+        }
+        let route = Route {
+            space: at.space,
+            answered,
+        };
+        let previous = self
+            .routes
+            .lock()
+            .expect("failover lock")
+            .insert(self.target.clone(), route);
+        if previous != Some(route) {
+            self.watch.changed();
+        }
+    }
 }
 
 impl Encloses for FailoverEndpoint {
@@ -1068,6 +1217,8 @@ impl Encloses for FailoverEndpoint {
 struct Candidate {
     endpoint: Arc<dyn Endpoint>,
     bindings: Bindings,
+    /// The index of the space it came from, in the list the failover was built with.
+    space: usize,
 }
 
 #[async_trait::async_trait]
@@ -1092,16 +1243,23 @@ impl Endpoint for FailoverEndpoint {
             //   endpoint from the kernel, dropping the recording on the floor.
             let attempt = inv.with_bindings(&candidate.bindings);
             match candidate.endpoint.invoke(&attempt).await {
-                Ok(representation) => return Ok(representation),
+                Ok(representation) => {
+                    self.ended(candidate, true);
+                    return Ok(representation);
+                }
                 Err(e) if i < last && advances(&e, inv.request.verb) => {
                     // This target is down or limited: try the next, if the run can
                     // afford another issue.
                     if !spend(inv) {
+                        self.ended(candidate, false);
                         return Err(e);
                     }
                     latest = Some(e);
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.ended(candidate, false);
+                    return Err(e);
+                }
             }
         }
         Err(latest.unwrap_or_else(|| {
@@ -1149,9 +1307,20 @@ impl Endpoint for FailoverEndpoint {
 /// unmatched targets pass through unthrottled.
 pub struct Throttle<S> {
     inner: S,
-    rules: Vec<(String, Arc<async_lock::Semaphore>)>,
+    rules: Vec<(String, Arc<Bulkhead>)>,
     /// One wrapper per (inner endpoint, capped prefix): see [`memo`].
     wrappers: Wrappers<(usize, String), ThrottleEndpoint>,
+    /// How work starting, parking or finishing reaches the state face: see
+    /// [`observed`](Self::observed).
+    watch: Arc<Watch>,
+}
+
+/// One capped prefix of a [`Throttle`]: its slots, and what holds and waits for them.
+struct Bulkhead {
+    max: usize,
+    semaphore: Arc<async_lock::Semaphore>,
+    running: AtomicUsize,
+    parked: AtomicUsize,
 }
 
 impl<S: Space> Throttle<S> {
@@ -1161,24 +1330,47 @@ impl<S: Space> Throttle<S> {
             inner,
             rules: Vec::new(),
             wrappers: Wrappers::new(),
+            watch: Watch::new(),
         }
     }
 
     /// Allow at most `max` concurrent invocations of resources whose IRI starts
     /// with `prefix`; the excess parks until a slot frees (builder).
     pub fn limit(mut self, prefix: impl Into<String>, max: usize) -> Self {
+        let max = max.max(1);
         self.rules.push((
             prefix.into(),
-            Arc::new(async_lock::Semaphore::new(max.max(1))),
+            Arc::new(Bulkhead {
+                max,
+                semaphore: Arc::new(async_lock::Semaphore::new(max)),
+                running: AtomicUsize::new(0),
+                parked: AtomicUsize::new(0),
+            }),
         ));
         // Longest prefix first, so `permit_for` takes the most specific match.
         self.rules
             .sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
+        self.watch.refresh(self.view());
         self
     }
 
-    /// The most specific rule matching `target` (its prefix and semaphore), if any.
-    fn rule_for(&self, target: &str) -> Option<&(String, Arc<async_lock::Semaphore>)> {
+    /// Serve this governor's bulkheads on `board` as `name` (builder), at
+    /// `urn:throttle:state:{name}`: one key per capped prefix, with the work running
+    /// and parked under it. See [`StateBoard`]; refused as [`RateLimit::observed`] is.
+    pub fn observed(self, board: &StateBoard, name: &str) -> Result<Self, Error> {
+        state::observe(board, name, &self.watch, self.view())?;
+        Ok(self)
+    }
+
+    fn view(&self) -> Arc<dyn Observed> {
+        Arc::new(ThrottleView {
+            governs: self.inner.id(),
+            rules: self.rules.clone(),
+        })
+    }
+
+    /// The most specific rule matching `target` (its prefix and bulkhead), if any.
+    fn rule_for(&self, target: &str) -> Option<&(String, Arc<Bulkhead>)> {
         self.rules
             .iter()
             .find(|(prefix, _)| target.starts_with(prefix))
@@ -1195,14 +1387,15 @@ impl<S: Space> Space for Throttle<S> {
             return Resolution::Hit(hit);
         }
         match self.rule_for(request.target.as_str()) {
-            Some((prefix, semaphore)) => {
+            Some((prefix, bulkhead)) => {
                 let inner = &hit.endpoint;
                 let throttled = self.wrappers.get_or_wrap(
                     (address(inner), prefix.clone()),
                     |_| true,
                     || ThrottleEndpoint {
                         inner: Arc::clone(inner),
-                        semaphore: Arc::clone(semaphore),
+                        bulkhead: Arc::clone(bulkhead),
+                        watch: Arc::clone(&self.watch),
                     },
                 );
                 Resolution::Hit(hit.with_endpoint(throttled))
@@ -1228,7 +1421,31 @@ impl<S: Space> Space for Throttle<S> {
 /// parking until one is free.
 struct ThrottleEndpoint {
     inner: Arc<dyn Endpoint>,
-    semaphore: Arc<async_lock::Semaphore>,
+    bulkhead: Arc<Bulkhead>,
+    watch: Arc<Watch>,
+}
+
+/// One unit of a [`Bulkhead`] count, held for as long as the work it counts: taken
+/// with a change, given back with one on drop, so a call dropped mid-flight (a
+/// [`Timeout`] above elapsed) is uncounted too.
+struct Counted<'a> {
+    count: &'a AtomicUsize,
+    watch: &'a Watch,
+}
+
+impl<'a> Counted<'a> {
+    fn take(count: &'a AtomicUsize, watch: &'a Watch) -> Self {
+        count.fetch_add(1, AtomicOrdering::SeqCst);
+        watch.changed();
+        Counted { count, watch }
+    }
+}
+
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, AtomicOrdering::SeqCst);
+        self.watch.changed();
+    }
 }
 
 impl Encloses for ThrottleEndpoint {
@@ -1241,7 +1458,16 @@ impl Encloses for ThrottleEndpoint {
 impl Endpoint for ThrottleEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
         // Park here until a slot frees; the guard releases it on drop, after invoke.
-        let _permit = self.semaphore.acquire_arc().await;
+        let bulkhead = &self.bulkhead;
+        let _permit = match bulkhead.semaphore.try_acquire_arc() {
+            Some(permit) => permit,
+            None => {
+                let _parked = Counted::take(&bulkhead.parked, &self.watch);
+                bulkhead.semaphore.acquire_arc().await
+            }
+        };
+        // Dropped before the permit: the count falls, then the slot frees.
+        let _running = Counted::take(&bulkhead.running, &self.watch);
         self.inner.invoke(inv).await
     }
 
@@ -1251,6 +1477,179 @@ impl Endpoint for ThrottleEndpoint {
 
     fn describe(&self) -> Description {
         self.inner.describe()
+    }
+}
+
+// -----------------------------------------------------------------------------------------
+// What each governor shows the state face (`state`): a view over the same shared state its
+// endpoints change, read under the same locks, never written.
+// -----------------------------------------------------------------------------------------
+
+/// The soonest of two pending changes.
+fn sooner(a: Option<Duration>, b: Duration) -> Option<Duration> {
+    Some(a.map_or(b, |a| a.min(b)))
+}
+
+/// Keep the first rule per prefix: the one `rule_for` takes (the sort is stable).
+fn first_per_prefix<T: Clone>(rules: &[(String, T)]) -> Vec<(String, T)> {
+    let mut seen = std::collections::BTreeMap::new();
+    for (prefix, rule) in rules {
+        seen.entry(prefix.clone()).or_insert_with(|| rule.clone());
+    }
+    seen.into_iter().collect()
+}
+
+struct RateLimitView {
+    governs: Option<Iri>,
+    rules: Vec<(String, Rate)>,
+    hits: Arc<Mutex<HashMap<String, VecDeque<Time>>>>,
+    clock: Option<Arc<dyn Clock>>,
+}
+
+impl Observed for RateLimitView {
+    fn read(&self) -> Reading {
+        let now = self.clock.as_ref().map(|clock| clock.now());
+        let hits = self.hits.lock().expect("throttle lock");
+        let mut next_change = None;
+        let keys = first_per_prefix(&self.rules)
+            .into_iter()
+            .map(|(prefix, rate)| {
+                // The hits still in the window at `now`: everything after those a whole
+                // window old, which `slide` drops from the front, so it is the same count
+                // `resolve` will see, found without walking the window. With no clock
+                // the window never slides, as `resolve` treats it.
+                let window = millis(rate.window);
+                let empty = VecDeque::new();
+                let charged = hits.get(&prefix).unwrap_or(&empty);
+                let aged = now.map_or(0, |now| {
+                    charged.partition_point(|&t| elapsed(now, t) >= window)
+                });
+                if let (Some(now), Some(&oldest)) = (now, charged.get(aged)) {
+                    let left = window.saturating_sub(elapsed(now, oldest));
+                    next_change = sooner(next_change, Duration::from_millis(left));
+                }
+                Key::Window {
+                    prefix,
+                    max: rate.max,
+                    window: rate.window,
+                    hits: u32::try_from(charged.len() - aged).unwrap_or(u32::MAX),
+                }
+            })
+            .collect();
+        Reading {
+            kind: Kind::RateLimit {
+                governs: self.governs.clone(),
+            },
+            keys,
+            next_change,
+        }
+    }
+}
+
+struct BreakerView {
+    governs: Option<Iri>,
+    threshold: u32,
+    cooldown: Duration,
+    states: Arc<Mutex<HashMap<String, Breaker>>>,
+    clock: Option<Arc<dyn Clock>>,
+}
+
+impl Observed for BreakerView {
+    fn read(&self) -> Reading {
+        let now = self.clock.as_ref().map(|clock| clock.now());
+        let states = self.states.lock().expect("breaker lock");
+        let mut targets: Vec<(&String, &Breaker)> = states.iter().collect();
+        targets.sort_by(|a, b| a.0.cmp(b.0));
+        let mut next_change = None;
+        let keys = targets
+            .into_iter()
+            .map(|(target, breaker)| {
+                let circuit = match (breaker.opened_at, now) {
+                    (None, _) => Circuit::Closed,
+                    (Some(opened), Some(now)) => {
+                        let cooled = elapsed(now, opened);
+                        let cooldown = millis(self.cooldown);
+                        if cooled < cooldown {
+                            next_change =
+                                sooner(next_change, Duration::from_millis(cooldown - cooled));
+                            Circuit::Open
+                        } else {
+                            Circuit::HalfOpen
+                        }
+                    }
+                    // Opened needs a clock; a breaker without one never opens.
+                    (Some(_), None) => Circuit::Open,
+                };
+                Key::Circuit {
+                    target: target.clone(),
+                    failures: breaker.failures,
+                    circuit,
+                }
+            })
+            .collect();
+        Reading {
+            kind: Kind::CircuitBreaker {
+                governs: self.governs.clone(),
+                threshold: self.threshold,
+                cooldown: self.cooldown,
+            },
+            keys,
+            next_change,
+        }
+    }
+}
+
+struct ThrottleView {
+    governs: Option<Iri>,
+    rules: Vec<(String, Arc<Bulkhead>)>,
+}
+
+impl Observed for ThrottleView {
+    fn read(&self) -> Reading {
+        let keys = first_per_prefix(&self.rules)
+            .into_iter()
+            .map(|(prefix, bulkhead)| Key::Bulkhead {
+                prefix,
+                max: bulkhead.max,
+                running: bulkhead.running.load(AtomicOrdering::SeqCst),
+                parked: bulkhead.parked.load(AtomicOrdering::SeqCst),
+            })
+            .collect();
+        Reading {
+            kind: Kind::Throttle {
+                governs: self.governs.clone(),
+            },
+            keys,
+            next_change: None,
+        }
+    }
+}
+
+struct FailoverView {
+    candidates: Vec<Option<Iri>>,
+    routes: Arc<Mutex<HashMap<String, Route>>>,
+}
+
+impl Observed for FailoverView {
+    fn read(&self) -> Reading {
+        let routes = self.routes.lock().expect("failover lock");
+        let mut targets: Vec<(&String, &Route)> = routes.iter().collect();
+        targets.sort_by(|a, b| a.0.cmp(b.0));
+        let keys = targets
+            .into_iter()
+            .map(|(target, route)| Key::Route {
+                target: target.clone(),
+                candidate: route.space,
+                answered: route.answered,
+            })
+            .collect();
+        Reading {
+            kind: Kind::Failover {
+                candidates: self.candidates.clone(),
+            },
+            keys,
+            next_change: None,
+        }
     }
 }
 
@@ -1333,12 +1732,19 @@ mod tests {
                 Description::new("real").verb(Verb::Source)
             }
         }
-        let candidate = |endpoint: Arc<dyn Endpoint>| Candidate {
+        let candidate = |endpoint: Arc<dyn Endpoint>, space| Candidate {
             endpoint,
             bindings: Bindings::new(),
+            space,
         };
         let failover = FailoverEndpoint {
-            candidates: vec![candidate(Arc::new(Unreachable)), candidate(Arc::new(Real))],
+            candidates: vec![
+                candidate(Arc::new(Unreachable), 0),
+                candidate(Arc::new(Real), 1),
+            ],
+            target: "urn:x".to_string(),
+            routes: Arc::default(),
+            watch: Watch::new(),
         };
         assert!(
             !failover.describe().action_specs().is_empty(),
