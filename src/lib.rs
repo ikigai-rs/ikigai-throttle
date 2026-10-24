@@ -110,6 +110,21 @@ pub use state::{
 };
 use state::{Circuit, Key, Kind, Observed, Reading, Watch};
 
+/// The `thr:` vocabulary ([`STATE_NS`]) as Turtle: an `owl:Ontology` at
+/// `https://ikigai-rs.dev/ns/throttle` defining every term the state face writes, with
+/// the domain and range it writes it with. This text IS the published document, served
+/// at that IRI (deployed by hand, checked against this repo by ikigai-devtools'
+/// `ns-drift`), and its `owl:versionInfo` is this crate's version.
+///
+/// ```
+/// let header = ikigai_throttle::VOCABULARY_TTL
+///     .lines()
+///     .find(|line| line.trim_start().starts_with("owl:versionInfo"))
+///     .unwrap();
+/// assert_eq!(header, format!("    owl:versionInfo \"{}\" .", env!("CARGO_PKG_VERSION")));
+/// ```
+pub const VOCABULARY_TTL: &str = include_str!("vocabulary.ttl");
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native_clock;
 #[cfg(not(target_arch = "wasm32"))]
