@@ -297,6 +297,39 @@ fn every_minted_name_is_addressable() {
     );
 }
 
+/// Prefixes are literal values, including characters that need Turtle escaping.
+#[test]
+fn hostile_prefixes_round_trip_as_raw_strings() {
+    let prefix = "urn:x:\"evil> ; a <urn:y> . \\\n\r\t\u{0001} café %22";
+    let board = StateBoard::new();
+    let limit = RateLimit::new(EndpointSpace::new())
+        .limit(prefix, Rate::new(1, Duration::from_secs(1)))
+        .observed(&board, "limit")
+        .unwrap();
+    let throttle = Throttle::new(EndpointSpace::new())
+        .limit(prefix, 1)
+        .observed(&board, "pool")
+        .unwrap();
+    let spaces: Vec<Arc<dyn Space>> =
+        vec![Arc::new(board.space()), Arc::new(limit), Arc::new(throttle)];
+    let kernel = Kernel::new(Arc::new(Fallback::new(spaces)));
+    let response =
+        block_on(kernel.issue(request(STATE, Some("text/turtle")), &Capability::root())).unwrap();
+    let graph = parse(std::str::from_utf8(&response.bytes).unwrap());
+    let prefixes: Vec<_> = graph
+        .iter()
+        .filter(|t| t.predicate.as_str() == thr("prefix"))
+        .map(|t| match &t.object {
+            Term::Literal(value) => {
+                assert_eq!(value.datatype().as_str(), XSD_STRING);
+                value.value()
+            }
+            other => panic!("a prefix must be a literal: {other}"),
+        })
+        .collect();
+    assert_eq!(prefixes, [prefix, prefix]);
+}
+
 /// Breaker transitions, one per step, each visible on the next read.
 #[test]
 fn a_circuit_trips_half_opens_and_closes() {

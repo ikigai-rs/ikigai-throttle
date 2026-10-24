@@ -28,6 +28,8 @@ async-trait = "0.1"
 async-lock = "3"
 # Timeout races the invoke against its Timer with `select`, which builds anywhere.
 futures = "0.3"
+# Shared RDF literal serializer for the state face's Turtle strings.
+oxrdf = "0.3.0"
 
 # The default Timer on a native target: a runtime-agnostic timer (futures-timer works
 # under the kernel's `block_on`, no tokio). NATIVE ONLY: its native backend reads
@@ -59,8 +61,6 @@ futures-timer = "3"
 # states as the library's true minimum, so tests build against it.
 ikigai-conformance = "0.10.0"
 # `tests/state.rs` parses `src/vocabulary.ttl` and the state face's Turtle, to hold the
-# face to its vocabulary (ledger #2175). Both are already in the graph through
-# ikigai-conformance. `TurtleParser::for_slice` is in every oxttl 0.2, which takes
-# oxrdf 0.3. ⚠ Each is a 0.x caret, so a ceiling too: `<0.3.0` and `<0.4.0`.
+# face to its vocabulary (ledger #2175). `TurtleParser::for_slice` is in every
+# oxttl 0.2, which takes oxrdf 0.3. ⚠ The 0.x caret sets a ceiling of `<0.3.0`.
 oxttl = "0.2.0"
-oxrdf = "0.3.0"
