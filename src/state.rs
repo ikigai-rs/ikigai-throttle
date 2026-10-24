@@ -85,7 +85,9 @@ pub const STATE: &str = "urn:throttle:state";
 /// reads is then decided by [`state_cap`], one grant per governor.
 pub const STATE_CAP_FAMILY: &str = "urn:cap:throttle:state:*";
 
-/// The vocabulary of the Turtle face, `thr:`. Not yet in the published `/ns` vocabulary.
+/// The vocabulary of the Turtle face, `thr:`: its own published vocabulary, defined in
+/// [`VOCABULARY_TTL`](crate::VOCABULARY_TTL) and served at
+/// `https://ikigai-rs.dev/ns/throttle`, separate from core's `/ns` (ledger #2175).
 pub const STATE_NS: &str = "https://ikigai-rs.dev/ns/throttle#";
 
 /// The grant that reads one governor: `urn:cap:throttle:state:{governor}`.

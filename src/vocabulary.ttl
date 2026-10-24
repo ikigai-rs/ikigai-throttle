@@ -1,0 +1,254 @@
+# The ikigai-throttle vocabulary: the terms of the governors' state face.
+#
+# `urn:throttle:state` (the `state` module, ledger #198) serves what the governors
+# hold as Turtle in these terms: a board, the governors on it, each governor's keys
+# (a rate window, a circuit, a bulkhead, a failover route) and a failover's
+# candidate spaces. Every term that face writes is defined here, with the domain and
+# range it is written with, and `tests/state.rs` holds the face to it: every `thr:`
+# term the face can write is defined, every literal it writes has its property's
+# range as its datatype, and every subject it writes a property on is typed into
+# that property's domain.
+#
+# Namespace note: self-contained under `https://ikigai-rs.dev/ns/throttle#`, the
+# precedent of ikigai-log's `log:` and ikigai-sign's `sig:`, and SEPARATE from the
+# core vocabulary at https://ikigai-rs.dev/ns (decided 2026-10-24, ledger #2175). A
+# term moves into core's `vocabulary.ttl` when it earns a second consumer. Folding
+# these into `ik:` today would collide: `ik:Route` and `ik:target` are routing
+# terms, with their own domain and range. The one core term used is `ik:order`
+# (a candidate's position), reused rather than restated; core gives it range
+# xsd:integer and, on purpose, no domain.
+#
+# This file IS the published document: it is served at
+# https://ikigai-rs.dev/ns/throttle, deployed by hand, and checked daily against
+# this repo's main by ikigai-devtools' `ns-drift`, which reads the
+# `owl:versionInfo` below on both sides. That line is the crate version
+# (test-pinned by `ontology_version_is_the_crate_version`), so redeploy
+# /ns/throttle after every release that changes this file, or the live copy claims
+# the previous one.
+#
+# Domains are stated only where they are true of EVERY subject the face writes the
+# property on. An rdfs:domain is an inference, not a constraint, so a property the
+# face writes on two unrelated classes (`thr:of`, `thr:governs`) declares none: a
+# narrower one would type a candidate as a key, or a key as a candidate.
+
+@prefix thr:  <https://ikigai-rs.dev/ns/throttle#> .
+@prefix ik:   <https://ikigai-rs.dev/ns#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+<https://ikigai-rs.dev/ns/throttle> a owl:Ontology ;
+    rdfs:label "ikigai-throttle vocabulary" ;
+    rdfs:comment "The terms of ikigai-throttle's state face (urn:throttle:state): the board, the governors observed on it, the keys each governor holds state for, and a failover's candidate spaces. Embedded in the ikigai-throttle crate as VOCABULARY_TTL." ;
+    owl:versionInfo "0.2.0" .
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The board and the governors
+# ═══════════════════════════════════════════════════════════════════════════
+
+thr:StateBoard a rdfs:Class ;
+    rdfs:label "StateBoard" ;
+    rdfs:comment "Where a host observes governors: urn:throttle:state, naming every governor on the board that the caller may read (thr:governor). A space of its own that the host mounts beside the governed one, so the overlays stay transparent to identity, enumeration and topology." .
+
+thr:Governor a rdfs:Class ;
+    rdfs:label "Governor" ;
+    rdfs:comment "One governor observed on a board, at urn:throttle:state:{governor}, named by thr:name. Never written itself: the face types each governor by its kind (the subclasses below), so query by kind, or by this class under RDFS entailment. Retry and Timeout hold state for one call only and are never governors on a board." .
+
+thr:RateLimit a rdfs:Class ;
+    rdfs:subClassOf thr:Governor ;
+    rdfs:label "RateLimit" ;
+    rdfs:comment "A RateLimit overlay: one thr:Window per limited prefix." .
+
+thr:CircuitBreaker a rdfs:Class ;
+    rdfs:subClassOf thr:Governor ;
+    rdfs:label "CircuitBreaker" ;
+    rdfs:comment "A CircuitBreaker overlay: its thr:threshold and thr:cooldownMillis, and one thr:Circuit per target that has failed." .
+
+thr:Throttle a rdfs:Class ;
+    rdfs:subClassOf thr:Governor ;
+    rdfs:label "Throttle" ;
+    rdfs:comment "A Throttle overlay (Nygard's Bulkhead): one thr:Bulkhead per capped prefix." .
+
+thr:Failover a rdfs:Class ;
+    rdfs:subClassOf thr:Governor ;
+    rdfs:label "Failover" ;
+    rdfs:comment "A Failover overlay: its candidate spaces in order (thr:candidate), and one thr:Route per target it has served. It encloses several spaces, so it names none under thr:governs; each candidate does." .
+
+thr:governor a rdf:Property ;
+    rdfs:domain thr:StateBoard ;
+    rdfs:range thr:Governor ;
+    rdfs:label "governor" ;
+    rdfs:comment "A governor on the board that the caller may read. One governor the caller may not read is left out exactly as one that is not on the board." .
+
+thr:name a rdf:Property ;
+    rdfs:domain thr:Governor ;
+    rdfs:range xsd:string ;
+    rdfs:label "name" ;
+    rdfs:comment "The name the host observed the governor under (lowercase ASCII letters, digits and -): the {governor} of its IRI, of its thread urn:throttle:governor:{governor} and of the grant urn:cap:throttle:state:{governor} that reads it." .
+
+thr:governs a rdf:Property ;
+    rdfs:range ik:Space ;
+    rdfs:label "governs" ;
+    rdfs:comment "The space a governor encloses, or a failover candidate stands for, by the Space::id the overlay forwards: the IRI urn:kernel:topology gives the same node, so the state joins to the arrangement. Absent when the space is anonymous. Written on a thr:RateLimit, thr:CircuitBreaker or thr:Throttle and on a thr:Candidate, so it declares no rdfs:domain." .
+
+thr:threshold a rdf:Property ;
+    rdfs:domain thr:CircuitBreaker ;
+    rdfs:range xsd:nonNegativeInteger ;
+    rdfs:label "threshold" ;
+    rdfs:comment "How many consecutive transient failures of one target trip its circuit open." .
+
+thr:cooldownMillis a rdf:Property ;
+    rdfs:domain thr:CircuitBreaker ;
+    rdfs:range xsd:nonNegativeInteger ;
+    rdfs:label "cooldownMillis" ;
+    rdfs:comment "How long an open circuit fails fast before it half-opens, in milliseconds." .
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Keys: what a governor holds state for
+# ═══════════════════════════════════════════════════════════════════════════
+
+thr:Key a rdfs:Class ;
+    rdfs:label "Key" ;
+    rdfs:comment "One key a governor holds state for, in the governor's own terms (a prefix or a target), at urn:throttle:state:{governor}:key:{key}, {key} the key spelled as a name. Never written itself: the face types each key by its kind (the subclasses below). Every key names its governor (thr:of) and its thr:state." .
+
+thr:Window a rdfs:Class ;
+    rdfs:subClassOf thr:Key ;
+    rdfs:label "Window" ;
+    rdfs:comment "A RateLimit's sliding window over one prefix: thr:hits of thr:max per thr:windowMillis, thr:Full once the hits reach the max, else thr:Admitting." .
+
+thr:Circuit a rdfs:Class ;
+    rdfs:subClassOf thr:Key ;
+    rdfs:label "Circuit" ;
+    rdfs:comment "A CircuitBreaker's circuit for one target: its consecutive transient thr:failures and whether it is thr:Closed, thr:Open or thr:HalfOpen." .
+
+thr:Bulkhead a rdfs:Class ;
+    rdfs:subClassOf thr:Key ;
+    rdfs:label "Bulkhead" ;
+    rdfs:comment "A Throttle's cap on one prefix: thr:running of thr:max, with thr:parked waiting for a slot; thr:Full once the running work reaches the max, else thr:Admitting." .
+
+thr:Route a rdfs:Class ;
+    rdfs:subClassOf thr:Key ;
+    rdfs:label "Route" ;
+    rdfs:comment "A Failover's route for one target: the candidate its last call ended at (thr:lastCandidate) and whether that call thr:Answered or thr:Failed. A failover route, unrelated to core's ik:Route, a routing rule." .
+
+thr:key a rdf:Property ;
+    rdfs:domain thr:Governor ;
+    rdfs:range thr:Key ;
+    rdfs:label "key" ;
+    rdfs:comment "A key the governor holds state for. The inverse of thr:of for keys." .
+
+thr:of a rdf:Property ;
+    rdfs:range thr:Governor ;
+    rdfs:label "of" ;
+    rdfs:comment "The governor a key or a candidate belongs to. Written on a thr:Key and on a thr:Candidate, so it declares no rdfs:domain." .
+
+thr:prefix a rdf:Property ;
+    rdfs:domain thr:Key ;
+    rdfs:range xsd:string ;
+    rdfs:label "prefix" ;
+    rdfs:comment "The URI prefix a thr:Window or thr:Bulkhead governs: every name beginning with it is counted against this key." .
+
+thr:target a rdf:Property ;
+    rdfs:domain thr:Key ;
+    rdfs:range rdfs:Resource ;
+    rdfs:label "target" ;
+    rdfs:comment "The target a thr:Circuit or thr:Route is kept for: the name that was called, as an IRI. Not ik:target, which is a route's IRI template." .
+
+thr:max a rdf:Property ;
+    rdfs:domain thr:Key ;
+    rdfs:range xsd:nonNegativeInteger ;
+    rdfs:label "max" ;
+    rdfs:comment "The cap on a key: the hits a thr:Window admits per window, or the work a thr:Bulkhead runs at once." .
+
+thr:windowMillis a rdf:Property ;
+    rdfs:domain thr:Window ;
+    rdfs:range xsd:nonNegativeInteger ;
+    rdfs:label "windowMillis" ;
+    rdfs:comment "The length of a sliding window, in milliseconds." .
+
+thr:hits a rdf:Property ;
+    rdfs:domain thr:Window ;
+    rdfs:range xsd:nonNegativeInteger ;
+    rdfs:label "hits" ;
+    rdfs:comment "The hits charged to the window and not yet aged out of it." .
+
+thr:failures a rdf:Property ;
+    rdfs:domain thr:Circuit ;
+    rdfs:range xsd:nonNegativeInteger ;
+    rdfs:label "failures" ;
+    rdfs:comment "The target's consecutive transient failures, reset by a success." .
+
+thr:running a rdf:Property ;
+    rdfs:domain thr:Bulkhead ;
+    rdfs:range xsd:nonNegativeInteger ;
+    rdfs:label "running" ;
+    rdfs:comment "The work under this prefix running now." .
+
+thr:parked a rdf:Property ;
+    rdfs:domain thr:Bulkhead ;
+    rdfs:range xsd:nonNegativeInteger ;
+    rdfs:label "parked" ;
+    rdfs:comment "The work under this prefix parked until a slot frees: backpressure, never an error." .
+
+thr:lastCandidate a rdf:Property ;
+    rdfs:domain thr:Route ;
+    rdfs:range thr:Candidate ;
+    rdfs:label "lastCandidate" ;
+    rdfs:comment "The candidate the last call to the route's target ended at, whether it answered or failed." .
+
+# ═══════════════════════════════════════════════════════════════════════════
+# A key's state
+# ═══════════════════════════════════════════════════════════════════════════
+
+thr:State a rdfs:Class ;
+    rdfs:label "State" ;
+    rdfs:comment "What a key is doing now, as an individual rather than a string, so a reader can ask what a state means. Each kind of key takes its own: a thr:Window or thr:Bulkhead is thr:Admitting or thr:Full, a thr:Circuit thr:Closed, thr:Open or thr:HalfOpen, a thr:Route thr:Answered or thr:Failed." .
+
+thr:state a rdf:Property ;
+    rdfs:domain thr:Key ;
+    rdfs:range thr:State ;
+    rdfs:label "state" ;
+    rdfs:comment "The key's state now. Exactly one per key." .
+
+thr:Admitting a thr:State ;
+    rdfs:label "Admitting" ;
+    rdfs:comment "A thr:Window or thr:Bulkhead below its thr:max: the next call is let through (a window) or runs at once (a bulkhead)." .
+
+thr:Full a thr:State ;
+    rdfs:label "Full" ;
+    rdfs:comment "A thr:Window or thr:Bulkhead at its thr:max: the next call to a window is refused retry-after, and the next to a bulkhead is parked until a slot frees." .
+
+thr:Closed a thr:State ;
+    rdfs:label "Closed" ;
+    rdfs:comment "A thr:Circuit below its breaker's thr:threshold: calls go through, and transient failures are counted." .
+
+thr:Open a thr:State ;
+    rdfs:label "Open" ;
+    rdfs:comment "A tripped thr:Circuit: calls fail fast, retry-after the cooldown left, without touching the dependency." .
+
+thr:HalfOpen a thr:State ;
+    rdfs:label "HalfOpen" ;
+    rdfs:comment "A thr:Circuit whose cooldown has run out: the next call is a probe, and its outcome closes the circuit or opens it again." .
+
+thr:Answered a thr:State ;
+    rdfs:label "Answered" ;
+    rdfs:comment "A thr:Route whose last call was answered, at its thr:lastCandidate." .
+
+thr:Failed a thr:State ;
+    rdfs:label "Failed" ;
+    rdfs:comment "A thr:Route whose last call failed, ending at its thr:lastCandidate." .
+
+# ═══════════════════════════════════════════════════════════════════════════
+# A failover's candidates
+# ═══════════════════════════════════════════════════════════════════════════
+
+thr:Candidate a rdfs:Class ;
+    rdfs:label "Candidate" ;
+    rdfs:comment "One of a failover's spaces, at urn:throttle:state:{governor}:candidate:{n}, n its position from 0 (ik:order): the space it stands for (thr:governs) and its failover (thr:of)." .
+
+thr:candidate a rdf:Property ;
+    rdfs:domain thr:Failover ;
+    rdfs:range thr:Candidate ;
+    rdfs:label "candidate" ;
+    rdfs:comment "One of the failover's candidate spaces; their order is each candidate's ik:order." .

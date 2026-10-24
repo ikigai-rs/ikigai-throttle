@@ -194,6 +194,26 @@ costs an unread governor one atomic swap per change. Measured on one machine
 four-governor board read costs about 15 µs live and 0.8 µs from the cache; a governed
 call costs the same observed or not (0.8 µs); a cut costs about 0.2 µs.
 
+## Vocabulary
+
+The Turtle face speaks `thr:`, `https://ikigai-rs.dev/ns/throttle#`, a vocabulary of
+its own. [`src/vocabulary.ttl`](src/vocabulary.ttl) defines every term the face writes
+(the board, the four governor classes under `thr:Governor`, the four key classes under
+`thr:Key`, a key's `thr:State`, a failover's `thr:Candidate`, and their properties),
+each with the domain and range the face writes it with; the crate exports it as
+`VOCABULARY_TTL`. The only core term the face uses is `ik:order`, reused, not restated.
+
+That file is the published document: it is served at
+`https://ikigai-rs.dev/ns/throttle`, deployed by hand, and compared with this repo's
+main by ikigai-devtools' `ns-drift`, which reads its `owl:versionInfo`. That line is the
+crate version (`ontology_version_is_the_crate_version` pins it), so redeploy after a
+release that changes the file. `tests/state.rs` holds the face to the document: every
+`thr:` term it can write is defined, every literal's datatype is its property's range,
+and every subject it writes a property on is typed into that property's domain.
+
+The namespace is separate from core's `/ns` on purpose, as ikigai-log's `/ns/log` is: a
+term moves into core's vocabulary only when a second consumer needs it.
+
 ## RateLimit
 
 ```rust

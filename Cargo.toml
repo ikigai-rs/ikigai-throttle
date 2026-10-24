@@ -58,3 +58,9 @@ futures-timer = "3"
 # Conformance's own floor is ikigai-core 0.1.108, which `[dependencies]` above already
 # states as the library's true minimum, so tests build against it.
 ikigai-conformance = "0.10.0"
+# `tests/state.rs` parses `src/vocabulary.ttl` and the state face's Turtle, to hold the
+# face to its vocabulary (ledger #2175). Both are already in the graph through
+# ikigai-conformance. `TurtleParser::for_slice` is in every oxttl 0.2, which takes
+# oxrdf 0.3. ⚠ Each is a 0.x caret, so a ceiling too: `<0.3.0` and `<0.4.0`.
+oxttl = "0.2.0"
+oxrdf = "0.3.0"

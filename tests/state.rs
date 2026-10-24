@@ -4,7 +4,8 @@
 //! here byte for byte: the names, the Turtle shape and the text face. Then what makes it
 //! safe to read: the capability and the sensitive-existence rule (ledger #14, D28), and
 //! what makes it cheap: cacheable, cut on each change, expiring at the next change time
-//! alone makes. Last, the overlays stay transparent to structure once observed, and the
+//! alone makes. Last, the overlays stay transparent to structure once observed, the face
+//! keeps to its published vocabulary (`src/vocabulary.ttl`, ledger #2175), and the
 //! conformance suite holds the face.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +22,8 @@ use ikigai_throttle::{
     governor_iri, state_cap, CircuitBreaker, Failover, Rate, RateLimit, StateBoard, Throttle,
     STATE, STATE_CAP_FAMILY,
 };
+use oxrdf::{NamedOrBlankNode, Term, Triple};
+use oxttl::TurtleParser;
 
 /// A clock that moves only when the test moves it, shared by the governors and the kernel
 /// (the module docs ask for one clock: a deadline is measured on the governor's and set on
@@ -587,6 +590,346 @@ fn an_observed_overlay_still_reports_what_it_encloses() {
             .collect()
     };
     assert_eq!(patterns(&observed), patterns(&bare));
+}
+
+// ---- the vocabulary: every term the face writes is defined, as it is written -----------
+//
+// `src/vocabulary.ttl` (`VOCABULARY_TTL`) is the document published at /ns/throttle
+// (ledger #2175). These hold it to the face: the face writes no `thr:` term the document
+// does not define, every literal it writes has its property's range as its datatype, and
+// every subject it writes a property on is typed into that property's domain.
+
+/// The ontology IRI: the document as https://ikigai-rs.dev/ns/throttle serves it.
+const ONTOLOGY: &str = "https://ikigai-rs.dev/ns/throttle";
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const RDF_PROPERTY: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property";
+const RDFS_CLASS: &str = "http://www.w3.org/2000/01/rdf-schema#Class";
+const RDFS_SUBCLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
+const RDFS_DOMAIN: &str = "http://www.w3.org/2000/01/rdf-schema#domain";
+const RDFS_RANGE: &str = "http://www.w3.org/2000/01/rdf-schema#range";
+const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
+const RDFS_COMMENT: &str = "http://www.w3.org/2000/01/rdf-schema#comment";
+const OWL_ONTOLOGY: &str = "http://www.w3.org/2002/07/owl#Ontology";
+const OWL_VERSION_INFO: &str = "http://www.w3.org/2002/07/owl#versionInfo";
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+/// The one core term the face writes, and the range core's vocabulary gives it.
+const IK_ORDER: &str = "https://ikigai-rs.dev/ns#order";
+const IK_ORDER_RANGE: &str = "http://www.w3.org/2001/XMLSchema#integer";
+/// Defined for a reader and a reasoner, never written by the face: each is the
+/// superclass of what the face does write.
+const NEVER_WRITTEN: [&str; 3] = ["Governor", "Key", "State"];
+
+fn parse(turtle: &str) -> Vec<Triple> {
+    TurtleParser::new()
+        .for_slice(turtle.as_bytes())
+        .map(|triple| triple.expect("the Turtle parses"))
+        .collect()
+}
+
+fn subject_iri(triple: &Triple) -> &str {
+    match &triple.subject {
+        NamedOrBlankNode::NamedNode(node) => node.as_str(),
+        other => panic!("no blank nodes, and {other} is one"),
+    }
+}
+
+fn object_iri(term: &Term) -> Option<&str> {
+    match term {
+        Term::NamedNode(node) => Some(node.as_str()),
+        _ => None,
+    }
+}
+
+fn thr(local: &str) -> String {
+    format!("{}{local}", ikigai_throttle::STATE_NS)
+}
+
+/// The vocabulary, read as RDF.
+struct Vocabulary(Vec<Triple>);
+
+impl Vocabulary {
+    fn load() -> Self {
+        Vocabulary(parse(ikigai_throttle::VOCABULARY_TTL))
+    }
+
+    fn objects<'a>(&'a self, subject: &'a str, predicate: &'a str) -> Vec<&'a Term> {
+        self.0
+            .iter()
+            .filter(move |t| subject_iri(t) == subject && t.predicate.as_str() == predicate)
+            .map(|t| &t.object)
+            .collect()
+    }
+
+    /// The one IRI `subject` has for `predicate`, if it has one.
+    fn iri(&self, subject: &str, predicate: &str) -> Option<String> {
+        let objects = self.objects(subject, predicate);
+        assert!(objects.len() <= 1, "{subject} has one {predicate} at most");
+        objects
+            .first()
+            .map(|o| object_iri(o).expect("an IRI").to_string())
+    }
+
+    fn is_a(&self, subject: &str, class: &str) -> bool {
+        self.objects(subject, RDF_TYPE)
+            .iter()
+            .any(|o| object_iri(o) == Some(class))
+    }
+
+    /// A property's one range, which every property states.
+    fn range(&self, property: &str) -> String {
+        self.iri(property, RDFS_RANGE)
+            .unwrap_or_else(|| panic!("{property} states its range"))
+    }
+
+    /// `class` is `ancestor` or under it along `rdfs:subClassOf`.
+    fn subclass_of(&self, class: &str, ancestor: &str) -> bool {
+        class == ancestor
+            || self
+                .objects(class, RDFS_SUBCLASS_OF)
+                .iter()
+                .filter_map(|o| object_iri(o))
+                .any(|parent| self.subclass_of(parent, ancestor))
+    }
+
+    /// Every `thr:` term the document defines.
+    fn terms(&self) -> std::collections::BTreeSet<String> {
+        self.0
+            .iter()
+            .map(subject_iri)
+            .filter(|s| s.starts_with(ikigai_throttle::STATE_NS))
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// The deployed /ns/throttle is a copy of `VOCABULARY_TTL`, and `owl:versionInfo` is how
+/// one deploy is told apart from the last: devtools' `ns-drift` prints it for the live
+/// and the repo side, and the release preflight moves it. It is the crate version, so
+/// the release bump must move it. Read twice, because two kinds of reader depend on it:
+/// as RDF (exactly one plain-string value on the ontology), and as the one text line the
+/// drift scan's regex finds.
+#[test]
+fn ontology_version_is_the_crate_version() {
+    let vocabulary = Vocabulary::load();
+    assert!(
+        vocabulary.is_a(ONTOLOGY, OWL_ONTOLOGY),
+        "{ONTOLOGY} is declared an owl:Ontology"
+    );
+    let versions = vocabulary.objects(ONTOLOGY, OWL_VERSION_INFO);
+    let [Term::Literal(version)] = versions.as_slice() else {
+        panic!("the ontology declares exactly one owl:versionInfo literal: {versions:?}");
+    };
+    assert_eq!(
+        version.datatype().as_str(),
+        XSD_STRING,
+        "a plain string, as core's is"
+    );
+    assert_eq!(
+        version.value(),
+        env!("CARGO_PKG_VERSION"),
+        "vocabulary.ttl's owl:versionInfo must be bumped with the crate version"
+    );
+
+    let lines: Vec<&str> = ikigai_throttle::VOCABULARY_TTL
+        .lines()
+        .filter(|l| l.trim_start().starts_with("owl:versionInfo"))
+        .collect();
+    assert_eq!(
+        lines,
+        [format!(
+            "    owl:versionInfo \"{}\" .",
+            env!("CARGO_PKG_VERSION")
+        )],
+        "exactly one owl:versionInfo line, in the form the drift scan and the preflight read"
+    );
+}
+
+/// Every term is a class, a property or a state, with one label and one comment; every
+/// property has one range and at most one domain, each a class or a datatype.
+#[test]
+fn every_term_is_described() {
+    let vocabulary = Vocabulary::load();
+    let terms = vocabulary.terms();
+    assert!(terms.len() > 30, "the whole vocabulary parsed: {terms:?}");
+    for term in std::iter::once(ONTOLOGY.to_string()).chain(terms.iter().cloned()) {
+        assert_eq!(
+            vocabulary.objects(&term, RDFS_LABEL).len(),
+            1,
+            "{term}: one label"
+        );
+        assert_eq!(
+            vocabulary.objects(&term, RDFS_COMMENT).len(),
+            1,
+            "{term}: one comment"
+        );
+    }
+    for term in &terms {
+        let kinds = [
+            vocabulary.is_a(term, RDFS_CLASS),
+            vocabulary.is_a(term, RDF_PROPERTY),
+            vocabulary.is_a(term, &thr("State")),
+        ];
+        assert_eq!(
+            kinds.iter().filter(|k| **k).count(),
+            1,
+            "{term} is exactly one of a class, a property or a state"
+        );
+        if vocabulary.is_a(term, RDF_PROPERTY) {
+            let range = vocabulary.range(term);
+            assert!(
+                range.starts_with(XSD)
+                    || vocabulary.is_a(&range, RDFS_CLASS)
+                    || range.starts_with("https://ikigai-rs.dev/ns#")
+                    || range == "http://www.w3.org/2000/01/rdf-schema#Resource",
+                "{term}'s range {range} is a datatype or a class"
+            );
+            if let Some(domain) = vocabulary.iri(term, RDFS_DOMAIN) {
+                assert!(
+                    vocabulary.is_a(&domain, RDFS_CLASS),
+                    "{term}'s domain {domain} is a thr: class"
+                );
+            }
+        }
+        if let Some(parent) = vocabulary.iri(term, RDFS_SUBCLASS_OF) {
+            assert!(
+                vocabulary.is_a(&parent, RDFS_CLASS),
+                "{term} is under a thr: class"
+            );
+        }
+    }
+}
+
+/// Every `thr:` term the face's source can write, read from the source itself, so a
+/// branch the drive below does not take (a closed circuit, a failed route) is held too.
+fn terms_in_source() -> std::collections::BTreeSet<String> {
+    let source = include_str!("../src/state.rs");
+    source
+        .match_indices("thr:")
+        .map(|(at, _)| {
+            source[at + 4..]
+                .chars()
+                .take_while(char::is_ascii_alphanumeric)
+                .collect::<String>()
+        })
+        .filter(|local| !local.is_empty())
+        .map(|local| thr(&local))
+        .collect()
+}
+
+/// ★ The face against its vocabulary (ledger #2175): what the source can write is defined
+/// (and nothing is defined that it cannot write, but the three superclasses), and the
+/// graph it writes, read from the pinned board in two states, keeps every literal in its
+/// property's range and every subject in its property's domain.
+#[test]
+fn every_term_the_face_writes_is_defined_as_written() {
+    let vocabulary = Vocabulary::load();
+    let defined = vocabulary.terms();
+    let written = terms_in_source();
+    let undefined: Vec<&String> = written.difference(&defined).collect();
+    assert!(
+        undefined.is_empty(),
+        "written, never defined: {undefined:?}"
+    );
+    let unwritten: Vec<&String> = defined
+        .difference(&written)
+        .filter(|t| !NEVER_WRITTEN.iter().any(|n| **t == thr(n)))
+        .collect();
+    assert!(
+        unwritten.is_empty(),
+        "defined, never written: {unwritten:?}"
+    );
+
+    // The pinned board, then later: the breaker half-open, the window full.
+    let host = host(true);
+    host.drive();
+    let mut boards = vec![host.turtle(STATE)];
+    host.clock.advance(30_000);
+    host.call("urn:demo:limit:ok").unwrap();
+    host.call("urn:demo:limit:ok").unwrap();
+    host.call("urn:demo:limit:ok").unwrap();
+    boards.push(host.turtle(STATE));
+    assert!(boards[1].contains("thr:HalfOpen") && boards[1].contains("thr:Full"));
+
+    let mut seen = std::collections::BTreeSet::new();
+    for board in &boards {
+        let graph = parse(board);
+        let types = |subject: &str| -> Vec<String> {
+            graph
+                .iter()
+                .filter(|t| subject_iri(t) == subject && t.predicate.as_str() == RDF_TYPE)
+                .filter_map(|t| object_iri(&t.object).map(str::to_string))
+                .collect()
+        };
+        for triple in &graph {
+            let subject = subject_iri(triple);
+            let predicate = triple.predicate.as_str();
+            seen.insert(predicate.to_string());
+            if predicate == RDF_TYPE {
+                let class = object_iri(&triple.object).expect("a class IRI");
+                assert!(
+                    vocabulary.is_a(class, RDFS_CLASS),
+                    "{subject} is typed {class}, a defined class"
+                );
+                continue;
+            }
+            if predicate == IK_ORDER {
+                let Term::Literal(order) = &triple.object else {
+                    panic!("ik:order is a literal");
+                };
+                assert_eq!(order.datatype().as_str(), IK_ORDER_RANGE, "core's range");
+                continue;
+            }
+            assert!(
+                vocabulary.is_a(predicate, RDF_PROPERTY),
+                "{predicate} is a defined property"
+            );
+            let range = vocabulary.range(predicate);
+            match &triple.object {
+                Term::Literal(literal) => assert_eq!(
+                    literal.datatype().as_str(),
+                    range,
+                    "{subject} {predicate} {literal}: the literal's datatype is the range"
+                ),
+                Term::NamedNode(object) => {
+                    let object = object.as_str();
+                    assert!(
+                        !range.starts_with(XSD),
+                        "{predicate}'s range is the datatype {range}, and it is written an IRI"
+                    );
+                    if vocabulary.is_a(&range, RDFS_CLASS) {
+                        assert!(
+                            vocabulary.is_a(object, &range)
+                                || types(object)
+                                    .iter()
+                                    .any(|class| vocabulary.subclass_of(class, &range)),
+                            "{subject} {predicate} <{object}>: the object is in the range {range}"
+                        );
+                    }
+                }
+                other => panic!("{subject} {predicate} {other}: no blank nodes"),
+            }
+            if let Some(domain) = vocabulary.iri(predicate, RDFS_DOMAIN) {
+                assert!(
+                    types(subject)
+                        .iter()
+                        .any(|class| vocabulary.subclass_of(class, &domain)),
+                    "{subject} carries {predicate}, so it is in the domain {domain}"
+                );
+            }
+        }
+    }
+    // Every property the vocabulary defines was written and checked above.
+    let properties: Vec<String> = defined
+        .iter()
+        .filter(|t| vocabulary.is_a(t, RDF_PROPERTY))
+        .cloned()
+        .collect();
+    let unchecked: Vec<&String> = properties.iter().filter(|p| !seen.contains(*p)).collect();
+    assert!(
+        unchecked.is_empty(),
+        "never written by the drive: {unchecked:?}"
+    );
 }
 
 // ---- the conformance suite holds the face ----------------------------------------------
