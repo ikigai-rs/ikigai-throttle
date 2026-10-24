@@ -45,11 +45,12 @@
 //! **Time comes from a core [`Clock`]**, never from the platform directly. The two
 //! governors that measure time, [`RateLimit`] (its window) and [`CircuitBreaker`]
 //! (its cooldown), read the clock they were given with `with_clock`, and default to
-//! a monotonic clock on a native target. On wasm32-unknown-unknown, where reading
-//! platform time panics, there is no default: the host installs a clock as it does
+//! a monotonic clock on a native target. On wasm32-unknown-unknown, where Rust's own
+//! platform time panics (a browser has a clock, but only behind JavaScript imports this
+//! library does not make), there is no default: the host installs a clock as it does
 //! for its kernel, and a governor without one refuses rather than guessing.
-//! [`Timeout`] needs a timer, which a clock cannot be, so it is native only; every
-//! other overlay here builds for wasm32 unchanged.
+//! [`Timeout`] and [`Retry`] wait on a [`Timer`], which a clock cannot be, injected the
+//! same way (`with_timer`; ledger #2189). Every overlay here builds for wasm32.
 //!
 //! **What the governors hold is readable, beside them.** A host observes a governor onto a
 //! [`StateBoard`] (`observed(&board, "name")`) and mounts [`StateBoard::space`] next to
@@ -129,9 +130,7 @@ pub const VOCABULARY_TTL: &str = include_str!("vocabulary.ttl");
 mod native_clock;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_timer;
-#[cfg(not(target_arch = "wasm32"))]
 mod timeout;
-#[cfg(not(target_arch = "wasm32"))]
 pub use timeout::Timeout;
 
 use ikigai_core::{

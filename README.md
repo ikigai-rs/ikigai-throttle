@@ -296,12 +296,17 @@ overlay exactly as it is bare.
   your kernel, or a test clock that moves only when the test moves it. Time is
   read in whole milliseconds. Never a temporal corridor's pinned clock: a window
   measured on a stopped clock never slides.
-- **wasm32-unknown-unknown:** every overlay but `Timeout` builds there (CI lints
-  the lib on wasm32). There is no default clock on wasm32, so the host installs
-  one, as it does for its kernel; a `RateLimit` or `CircuitBreaker` without one
-  refuses what it governs with an error naming `with_clock`, and never panics.
-  `Timeout` is native only: it needs a timer that wakes a future, which a clock
-  is not, and futures-timer's native backend panics on wasm32.
+- **wasm32-unknown-unknown:** every overlay builds there (CI lints the lib on
+  wasm32). A browser has a clock and timers, but this library cannot reach them
+  without JavaScript imports, and the same target also runs where there is no
+  JavaScript (wasmtime). So the HOST supplies them, as it does for its kernel: a
+  clock for `RateLimit` and `CircuitBreaker` (`with_clock`), and a `Timer` for
+  `Timeout` and `Retry` (`with_timer`; a timer wakes a future, which a clock
+  cannot). Without one, `RateLimit`, `CircuitBreaker` and `Timeout` refuse what
+  they govern with an error naming the builder, and never panic; a `Retry` without
+  a timer returns every `RetryAfter` unchanged. A browser host's timer resolves a
+  `setTimeout` promise in a `spawn_local` task and hands the wake-up back over a
+  channel, which keeps the future `Send`.
 - `Timeout` bounds *genuinely-async* work. A purely **synchronous blocking** call
   inside an invoke never yields to the executor, so a single-threaded runtime
   can't fire the timer; that hang is fixed at the transport (a socket read
