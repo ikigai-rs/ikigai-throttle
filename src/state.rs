@@ -662,9 +662,8 @@ struct Node {
     governor: Option<String>,
 }
 
-/// An object, already safe to write: every string here is IRI-escaped
-/// ([`escape_iri_fragment`]), so it holds no `"`, `\` or control character and needs no
-/// literal escaping.
+/// An object in the state graph. IRIs are IRI-escaped; strings keep their raw value
+/// until [`ikigai_core::turtle_literal`] writes them as Turtle literals.
 enum Obj {
     Iri(String),
     Str(String),
@@ -782,7 +781,7 @@ fn governor_nodes(name: &str, reading: &Reading) -> Vec<Node> {
 fn key_node(name: &str, governor: &str, key: &Key) -> Node {
     let of = ("thr:of", Obj::Iri(governor.to_string()));
     let target_iri = |t: &str| Obj::Iri(escape_iri_fragment(t).into_owned());
-    let prefix_str = |p: &str| Obj::Str(escape_iri_fragment(p).into_owned());
+    let prefix_str = |p: &str| Obj::Str(p.to_string());
     let (iri, class, props, text) = match key {
         Key::Window {
             prefix,
@@ -943,7 +942,7 @@ fn turtle(nodes: &[Node]) -> String {
         for (predicate, object) in &node.props {
             let object = match object {
                 Obj::Iri(iri) => format!("<{iri}>"),
-                Obj::Str(s) => format!("\"{s}\""),
+                Obj::Str(s) => ikigai_core::turtle_literal(s),
                 Obj::Count(n) => format!("\"{n}\"^^xsd:nonNegativeInteger"),
                 Obj::Order(n) => format!("\"{n}\"^^xsd:integer"),
                 Obj::Term(term) => (*term).to_string(),

@@ -20,8 +20,10 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 # Invocation::time_left). Older, still used: Space::topology + Space::id (ledger
 # #978), Resolution::map_endpoint, Invocation::with_bindings (each Failover
 # candidate is invoked on the captures ITS OWN grammar took).
-# ⚠ Under 0.x caret rules "0.1.108" is >=0.1.108, <0.2.0.
-ikigai-core = "0.1.108"
+# 0.1.112: `turtle_literal`, the state face's string literals, written the one way core writes
+# Turtle (ledger #2222), so this crate needs no RDF library of its own.
+# ⚠ Under 0.x caret rules "0.1.112" is >=0.1.112, <0.2.0.
+ikigai-core = "0.1.112"
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
 # Throttle parks the excess on a fair async Semaphore (runtime-agnostic).
@@ -55,8 +57,8 @@ futures-timer = "3"
 # on a binding) and RECOMPUTE; 0.10.0 adds FAILURES, OFF unless a suite opts in
 # (`Suite::check_failures()`, not turned on here).
 # ⚠ `"0.10.0"` is `>=0.10.0, <0.11.0` under Cargo's 0.x rules: raise it when 0.11 ships.
-# Conformance's own floor is ikigai-core 0.1.108, which `[dependencies]` above already
-# states as the library's true minimum, so tests build against it.
+# Conformance's own floor is ikigai-core 0.1.108, below the library's 0.1.112 in
+# `[dependencies]` above, so tests build against the library's floor.
 ikigai-conformance = "0.10.0"
 # `tests/state.rs` parses `src/vocabulary.ttl` and the state face's Turtle, to hold the
 # face to its vocabulary (ledger #2175). Both are already in the graph through
