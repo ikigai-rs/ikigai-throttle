@@ -663,7 +663,7 @@ struct Node {
 }
 
 /// An object in the state graph. IRIs are IRI-escaped; strings keep their raw value
-/// until the Turtle literal serializer writes them.
+/// until [`ikigai_core::turtle_literal`] writes them as Turtle literals.
 enum Obj {
     Iri(String),
     Str(String),
@@ -942,7 +942,7 @@ fn turtle(nodes: &[Node]) -> String {
         for (predicate, object) in &node.props {
             let object = match object {
                 Obj::Iri(iri) => format!("<{iri}>"),
-                Obj::Str(s) => oxrdf::Literal::new_simple_literal(s.as_str()).to_string(),
+                Obj::Str(s) => ikigai_core::turtle_literal(s),
                 Obj::Count(n) => format!("\"{n}\"^^xsd:nonNegativeInteger"),
                 Obj::Order(n) => format!("\"{n}\"^^xsd:integer"),
                 Obj::Term(term) => (*term).to_string(),

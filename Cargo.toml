@@ -20,16 +20,16 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 # Invocation::time_left). Older, still used: Space::topology + Space::id (ledger
 # #978), Resolution::map_endpoint, Invocation::with_bindings (each Failover
 # candidate is invoked on the captures ITS OWN grammar took).
-# ⚠ Under 0.x caret rules "0.1.108" is >=0.1.108, <0.2.0.
-ikigai-core = "0.1.108"
+# 0.1.112: `turtle_literal`, the state face's string literals, written the one way core writes
+# Turtle (ledger #2222), so this crate needs no RDF library of its own.
+# ⚠ Under 0.x caret rules "0.1.112" is >=0.1.112, <0.2.0.
+ikigai-core = "0.1.112"
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
 # Throttle parks the excess on a fair async Semaphore (runtime-agnostic).
 async-lock = "3"
 # Timeout races the invoke against its Timer with `select`, which builds anywhere.
 futures = "0.3"
-# Shared RDF literal serializer for the state face's Turtle strings.
-oxrdf = "0.3.0"
 
 # The default Timer on a native target: a runtime-agnostic timer (futures-timer works
 # under the kernel's `block_on`, no tokio). NATIVE ONLY: its native backend reads
@@ -37,11 +37,6 @@ oxrdf = "0.3.0"
 # runtime, so on wasm32 the host injects a Timer instead (ledger #2189).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 futures-timer = "3"
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-# oxrdf also supports random blank-node IDs and pulls in getrandom through rand.
-# We only serialize literals, but that dependency still needs a wasm backend to build.
-getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
 # The module recipe as one test (`tests/conformance.rs`). This crate binds no
@@ -62,10 +57,12 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 # on a binding) and RECOMPUTE; 0.10.0 adds FAILURES, OFF unless a suite opts in
 # (`Suite::check_failures()`, not turned on here).
 # ⚠ `"0.10.0"` is `>=0.10.0, <0.11.0` under Cargo's 0.x rules: raise it when 0.11 ships.
-# Conformance's own floor is ikigai-core 0.1.108, which `[dependencies]` above already
-# states as the library's true minimum, so tests build against it.
+# Conformance's own floor is ikigai-core 0.1.108, below the library's 0.1.112 in
+# `[dependencies]` above, so tests build against the library's floor.
 ikigai-conformance = "0.10.0"
 # `tests/state.rs` parses `src/vocabulary.ttl` and the state face's Turtle, to hold the
-# face to its vocabulary (ledger #2175). `TurtleParser::for_slice` is in every
-# oxttl 0.2, which takes oxrdf 0.3. ⚠ The 0.x caret sets a ceiling of `<0.3.0`.
+# face to its vocabulary (ledger #2175). Both are already in the graph through
+# ikigai-conformance. `TurtleParser::for_slice` is in every oxttl 0.2, which takes
+# oxrdf 0.3. ⚠ Each is a 0.x caret, so a ceiling too: `<0.3.0` and `<0.4.0`.
 oxttl = "0.2.0"
+oxrdf = "0.3.0"
