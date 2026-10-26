@@ -61,6 +61,23 @@
 //! not found. The overlays themselves are unchanged: still transparent to identity,
 //! enumeration and topology. See [`StateBoard`] and the `state` module's docs.
 //!
+//! **A streamed body passes through, governed** (ledger #2263). Every overlay forwards
+//! [`Endpoint::invoke_body`], so a body issued through it
+//! ([`Kernel::issue_body`](ikigai_core::Kernel::issue_body)) arrives as the endpoint
+//! below answered it, a one-shot body still one-shot and unread, and never collected
+//! into a buffer on the way. Each governor's meaning over a one-shot body:
+//!
+//! | overlay | over a one-shot body |
+//! | --- | --- |
+//! | [`Timeout`] | the budget covers the drain: still streaming when it elapses, the body ends with the transient timeout |
+//! | [`Retry`], [`Failover`] | act only on a failure before the body is handed over; a one-shot body cannot be replayed, so a failure part-way through is the reader's |
+//! | [`CircuitBreaker`] | counts the body when it ends: read to its end, a success; failed part-way, by its error's class, as a failed call; dropped unread, neither |
+//! | [`Throttle`] | holds its slot until the body ends or is dropped |
+//! | [`RateLimit`] | charges the call; a rate counts starts, not bytes |
+//!
+//! A buffer or a body that can be read again is complete when it is handed over, and
+//! each governor treats it as it treats a bytes answer.
+//!
 //! The reliability overlays read the request **verb**
 //! ([`Verb::is_idempotent`](ikigai_core::Verb::is_idempotent) governs whether a re-issue
 //! is *safe*) and the failure's [**class**](ikigai_core::Error::class) (whether it is
@@ -99,6 +116,9 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+mod body;
+use body::{on_end, Face};
+
 mod memo;
 use memo::{address, digest, Encloses, Wrappers};
 
@@ -134,8 +154,8 @@ mod timeout;
 pub use timeout::Timeout;
 
 use ikigai_core::{
-    Bindings, Clock, Description, Endpoint, Error, FailureClass, Invocation, Iri, Representation,
-    Request, Resolution, Resolved, Scope, Space, SpaceEntry, Time, Topology, Verb,
+    Bindings, Body, Clock, Description, Endpoint, Error, FailureClass, Invocation, Iri,
+    Representation, Request, Resolution, Resolved, Scope, Space, SpaceEntry, Time, Topology, Verb,
 };
 use std::sync::Arc;
 
@@ -488,9 +508,10 @@ impl Encloses for RateLimited {
     }
 }
 
-#[async_trait::async_trait]
-impl Endpoint for RateLimited {
-    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+impl RateLimited {
+    /// Charge the window, then invoke on face `F`: a body is passed on as it is, since a
+    /// rate counts starts, not bytes.
+    async fn admitted<F: Face>(&self, inv: &Invocation<'_>) -> Result<F, Error> {
         let Some(clock) = &self.clock else {
             return Err(Error::Endpoint(format!(
                 "rate-limited: `{}` has no clock to measure its window — \
@@ -502,7 +523,7 @@ impl Endpoint for RateLimited {
             // The window opened since resolution: this call is within budget now.
             Ok(()) => {
                 self.watch.changed();
-                self.inner.invoke(inv).await
+                F::call(&*self.inner, inv).await
             }
             Err(delay) => Err(Error::RetryAfter {
                 delay,
@@ -514,6 +535,17 @@ impl Endpoint for RateLimited {
                 ),
             }),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl Endpoint for RateLimited {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+        self.admitted(inv).await
+    }
+
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>, Error> {
+        self.admitted(inv).await
     }
 
     fn name(&self) -> &str {
@@ -715,12 +747,15 @@ impl Encloses for RetryEndpoint {
     }
 }
 
-#[async_trait::async_trait]
-impl Endpoint for RetryEndpoint {
-    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+impl RetryEndpoint {
+    /// Invoke on face `F`, re-issuing while the failure allows it. On the body face that
+    /// is a failure BEFORE the body is handed over: once it is, a one-shot body cannot be
+    /// replayed, so a failure part-way through ends the body for its reader (and a
+    /// breaker below counts it).
+    async fn attempts<F: Face>(&self, inv: &Invocation<'_>) -> Result<F, Error> {
         let mut attempt = 1;
         loop {
-            let error = match self.inner.invoke(inv).await {
+            let error = match F::call(&*self.inner, inv).await {
                 Ok(representation) => return Ok(representation),
                 Err(error) => error,
             };
@@ -741,6 +776,17 @@ impl Endpoint for RetryEndpoint {
             }
             attempt += 1;
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl Endpoint for RetryEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+        self.attempts(inv).await
+    }
+
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>, Error> {
+        self.attempts(inv).await
     }
 
     fn name(&self) -> &str {
@@ -870,15 +916,17 @@ impl<S: Space> Space for CircuitBreaker<S> {
             let target = request.target.as_str();
             self.wrappers.get_or_wrap(
                 (address(&inner), digest(target)),
-                |wrapper| wrapper.target == target,
+                |wrapper| wrapper.tally.target == target,
                 || BreakerEndpoint {
                     inner,
-                    target: target.to_string(),
-                    threshold: self.threshold,
                     cooldown: self.cooldown,
-                    states: Arc::clone(&self.states),
                     clock: self.clock.clone(),
-                    watch: Arc::clone(&self.watch),
+                    tally: Arc::new(Tally {
+                        target: target.to_string(),
+                        threshold: self.threshold,
+                        states: Arc::clone(&self.states),
+                        watch: Arc::clone(&self.watch),
+                    }),
                 },
             ) as Arc<dyn Endpoint>
         })
@@ -901,12 +949,81 @@ impl<S: Space> Space for CircuitBreaker<S> {
 /// before invoking, and update it after.
 struct BreakerEndpoint {
     inner: Arc<dyn Endpoint>,
+    cooldown: Duration,
+    clock: Option<Arc<dyn Clock>>,
+    /// Shared with a one-shot body in flight, which updates the circuit when it ends.
+    tally: Arc<Tally>,
+}
+
+/// One target's circuit, as an outcome updates it.
+struct Tally {
     target: String,
     threshold: u32,
-    cooldown: Duration,
     states: Arc<Mutex<HashMap<String, Breaker>>>,
-    clock: Option<Arc<dyn Clock>>,
     watch: Arc<Watch>,
+}
+
+impl Tally {
+    /// Update the circuit for an outcome: `None` is a success, which closes it (and
+    /// confirms a probe); a transient failure counts toward tripping it (or re-opens a
+    /// failed probe); no other class says the dependency is broken.
+    fn record(&self, clock: &dyn Clock, failure: Option<&Error>) {
+        let mut states = self.states.lock().expect("breaker lock");
+        let changed = match failure {
+            None => match states.get_mut(&self.target) {
+                Some(breaker) if breaker.failures != 0 || breaker.opened_at.is_some() => {
+                    breaker.failures = 0;
+                    breaker.opened_at = None;
+                    true
+                }
+                _ => false, // already closed: nothing changed
+            },
+            Some(e) if e.class() == FailureClass::Transient => {
+                let breaker = states.entry(self.target.clone()).or_default();
+                breaker.failures = breaker.failures.saturating_add(1);
+                if breaker.failures >= self.threshold {
+                    breaker.opened_at = Some(clock.now()); // trip, or re-open a failed probe
+                }
+                true
+            }
+            Some(_) => false,
+        };
+        drop(states);
+        if changed {
+            self.watch.changed();
+        }
+    }
+}
+
+impl BreakerEndpoint {
+    /// The clock, when the circuit lets this call through (closed, or a half-open probe);
+    /// otherwise the refusal.
+    fn gate(&self) -> Result<&Arc<dyn Clock>, Error> {
+        // No clock, no cooldown to measure: refuse rather than guess (`with_clock`).
+        let Some(clock) = &self.clock else {
+            return Err(Error::Endpoint(format!(
+                "circuit breaker for `{}` has no clock to measure its cooldown — \
+                 install one with CircuitBreaker::with_clock",
+                self.tally.target
+            )));
+        };
+        // Gate: if open and still cooling, fail fast without touching the dependency.
+        // A target with no entry is closed; reading it never creates one, so the state
+        // face lists only targets that have failed (a closed circuit with no history is
+        // what an absent key means).
+        let states = self.tally.states.lock().expect("breaker lock");
+        if let Some(opened) = states.get(&self.tally.target).and_then(|b| b.opened_at) {
+            let cooled = elapsed(clock.now(), opened);
+            if cooled < millis(self.cooldown) {
+                return Err(Error::RetryAfter {
+                    delay: Some(self.cooldown.saturating_sub(Duration::from_millis(cooled))),
+                    detail: format!("circuit open for `{}`", self.tally.target),
+                });
+            }
+            // Cooldown elapsed → let this call through as a half-open probe.
+        }
+        Ok(clock)
+    }
 }
 
 impl Encloses for BreakerEndpoint {
@@ -918,59 +1035,29 @@ impl Encloses for BreakerEndpoint {
 #[async_trait::async_trait]
 impl Endpoint for BreakerEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
-        // No clock, no cooldown to measure: refuse rather than guess (`with_clock`).
-        let Some(clock) = &self.clock else {
-            return Err(Error::Endpoint(format!(
-                "circuit breaker for `{}` has no clock to measure its cooldown — \
-                 install one with CircuitBreaker::with_clock",
-                self.target
-            )));
-        };
-        // Gate: if open and still cooling, fail fast without touching the dependency.
-        // A target with no entry is closed; reading it never creates one, so the state
-        // face lists only targets that have failed (a closed circuit with no history is
-        // what an absent key means).
-        {
-            let states = self.states.lock().expect("breaker lock");
-            if let Some(opened) = states.get(&self.target).and_then(|b| b.opened_at) {
-                let cooled = elapsed(clock.now(), opened);
-                if cooled < millis(self.cooldown) {
-                    return Err(Error::RetryAfter {
-                        delay: Some(self.cooldown.saturating_sub(Duration::from_millis(cooled))),
-                        detail: format!("circuit open for `{}`", self.target),
-                    });
-                }
-                // Cooldown elapsed → let this call through as a half-open probe.
-            }
-        }
-        // Invoke (closed, or a half-open probe), then update the circuit.
+        let clock = self.gate()?;
         let outcome = self.inner.invoke(inv).await;
-        let mut states = self.states.lock().expect("breaker lock");
-        let changed = match &outcome {
-            Ok(_) => match states.get_mut(&self.target) {
-                // Success closes the circuit (and confirms a probe).
-                Some(breaker) if breaker.failures != 0 || breaker.opened_at.is_some() => {
-                    breaker.failures = 0;
-                    breaker.opened_at = None;
-                    true
-                }
-                _ => false, // already closed: nothing changed
-            },
-            Err(e) if e.class() == FailureClass::Transient => {
-                let breaker = states.entry(self.target.clone()).or_default();
-                breaker.failures = breaker.failures.saturating_add(1);
-                if breaker.failures >= self.threshold {
-                    breaker.opened_at = Some(clock.now()); // trip, or re-open a failed probe
-                }
-                true
-            }
-            Err(_) => false, // no other class says the dependency is broken
-        };
-        drop(states);
-        if changed {
-            self.watch.changed();
-        }
+        self.tally.record(&**clock, outcome.as_ref().err());
         outcome
+    }
+
+    /// A one-shot body is counted when it ENDS: read to its end, a success; failed
+    /// part-way, by its error's class, as a call failing so would be. A body dropped
+    /// unread counts neither way.
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>, Error> {
+        let clock = self.gate()?;
+        match self.inner.invoke_body(inv).await {
+            Ok(representation) => {
+                let (tally, clock) = (Arc::clone(&self.tally), Arc::clone(clock));
+                Ok(on_end(representation, move |failure| {
+                    tally.record(&*clock, failure)
+                }))
+            }
+            Err(error) => {
+                self.tally.record(&**clock, Some(&error));
+                Err(error)
+            }
+        }
     }
 
     fn name(&self) -> &str {
@@ -1235,9 +1322,11 @@ struct Candidate {
     space: usize,
 }
 
-#[async_trait::async_trait]
-impl Endpoint for FailoverEndpoint {
-    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+impl FailoverEndpoint {
+    /// Walk the candidates on face `F`. On the body face an advance happens only on a
+    /// failure BEFORE the body is handed over: a body the answering candidate started is
+    /// that candidate's, and a failure part-way through ends it for its reader.
+    async fn walk<F: Face>(&self, inv: &Invocation<'_>) -> Result<F, Error> {
         let last = self.candidates.len().saturating_sub(1);
         let mut latest = None;
         for (i, candidate) in self.candidates.iter().enumerate() {
@@ -1256,7 +1345,7 @@ impl Endpoint for FailoverEndpoint {
             //   `Invocation::detached` would compile here and would sever the
             //   endpoint from the kernel, dropping the recording on the floor.
             let attempt = inv.with_bindings(&candidate.bindings);
-            match candidate.endpoint.invoke(&attempt).await {
+            match F::call(&*candidate.endpoint, &attempt).await {
                 Ok(representation) => {
                     self.ended(candidate, true);
                     return Ok(representation);
@@ -1279,6 +1368,17 @@ impl Endpoint for FailoverEndpoint {
         Err(latest.unwrap_or_else(|| {
             Error::Unavailable("no failover target resolved the request".into())
         }))
+    }
+}
+
+#[async_trait::async_trait]
+impl Endpoint for FailoverEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
+        self.walk(inv).await
+    }
+
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>, Error> {
+        self.walk(inv).await
     }
 
     fn name(&self) -> &str {
@@ -1442,23 +1542,58 @@ struct ThrottleEndpoint {
 /// One unit of a [`Bulkhead`] count, held for as long as the work it counts: taken
 /// with a change, given back with one on drop, so a call dropped mid-flight (a
 /// [`Timeout`] above elapsed) is uncounted too.
-struct Counted<'a> {
-    count: &'a AtomicUsize,
-    watch: &'a Watch,
+struct Counted {
+    bulkhead: Arc<Bulkhead>,
+    count: fn(&Bulkhead) -> &AtomicUsize,
+    watch: Arc<Watch>,
 }
 
-impl<'a> Counted<'a> {
-    fn take(count: &'a AtomicUsize, watch: &'a Watch) -> Self {
-        count.fetch_add(1, AtomicOrdering::SeqCst);
+impl Counted {
+    fn take(
+        bulkhead: &Arc<Bulkhead>,
+        count: fn(&Bulkhead) -> &AtomicUsize,
+        watch: &Arc<Watch>,
+    ) -> Self {
+        count(bulkhead).fetch_add(1, AtomicOrdering::SeqCst);
         watch.changed();
-        Counted { count, watch }
+        Counted {
+            bulkhead: Arc::clone(bulkhead),
+            count,
+            watch: Arc::clone(watch),
+        }
     }
 }
 
-impl Drop for Counted<'_> {
+impl Drop for Counted {
     fn drop(&mut self) {
-        self.count.fetch_sub(1, AtomicOrdering::SeqCst);
+        (self.count)(&self.bulkhead).fetch_sub(1, AtomicOrdering::SeqCst);
         self.watch.changed();
+    }
+}
+
+/// A slot of a [`Bulkhead`], held by the work running in it.
+struct Slot {
+    // Dropped before the permit (fields drop in order): the count falls, then the slot
+    // frees.
+    _running: Counted,
+    _permit: async_lock::SemaphoreGuardArc,
+}
+
+impl ThrottleEndpoint {
+    /// Take a slot, parking until one is free.
+    async fn slot(&self) -> Slot {
+        let bulkhead = &self.bulkhead;
+        let permit = match bulkhead.semaphore.try_acquire_arc() {
+            Some(permit) => permit,
+            None => {
+                let _parked = Counted::take(bulkhead, |b| &b.parked, &self.watch);
+                bulkhead.semaphore.acquire_arc().await
+            }
+        };
+        Slot {
+            _running: Counted::take(bulkhead, |b| &b.running, &self.watch),
+            _permit: permit,
+        }
     }
 }
 
@@ -1471,18 +1606,17 @@ impl Encloses for ThrottleEndpoint {
 #[async_trait::async_trait]
 impl Endpoint for ThrottleEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
-        // Park here until a slot frees; the guard releases it on drop, after invoke.
-        let bulkhead = &self.bulkhead;
-        let _permit = match bulkhead.semaphore.try_acquire_arc() {
-            Some(permit) => permit,
-            None => {
-                let _parked = Counted::take(&bulkhead.parked, &self.watch);
-                bulkhead.semaphore.acquire_arc().await
-            }
-        };
-        // Dropped before the permit: the count falls, then the slot frees.
-        let _running = Counted::take(&bulkhead.running, &self.watch);
+        // Park here until a slot frees; it is released on drop, after invoke.
+        let _slot = self.slot().await;
         self.inner.invoke(inv).await
+    }
+
+    /// A one-shot body holds its slot until it ends, or is dropped: the work under the
+    /// cap is still running while it is read.
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>, Error> {
+        let slot = self.slot().await;
+        let representation = self.inner.invoke_body(inv).await?;
+        Ok(on_end(representation, move |_| drop(slot)))
     }
 
     fn name(&self) -> &str {

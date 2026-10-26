@@ -66,3 +66,12 @@ ikigai-conformance = "0.10.0"
 # oxrdf 0.3. ⚠ Each is a 0.x caret, so a ceiling too: `<0.3.0` and `<0.4.0`.
 oxttl = "0.2.0"
 oxrdf = "0.3.0"
+
+# ⚠ UNRELEASED CORE (ledger #2263): every overlay forwards `Endpoint::invoke_body`, which
+# is on ikigai-core's main (PR 247, ledger #2237) and in no published core yet: 0.1.112
+# predates it. This pins that commit until core publishes it. Before this crate's next
+# release, delete this section and raise the floor in `[dependencies]` to the core that
+# ships `invoke_body` (`cargo publish` drops a `[patch]`, and against 0.1.112 the crate
+# does not build). Ignored by every consumer's build: a `[patch]` is the root's only.
+[patch.crates-io]
+ikigai-core = { git = "https://github.com/ikigai-rs/ikigai-core", rev = "e3cce6a3fa3803dde0d25db23f4bd30d92dce6e2" }

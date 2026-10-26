@@ -10,14 +10,19 @@
 //! refuses what it governs, naming [`with_timer`](Timeout::with_timer): never a panic, and
 //! never an unbounded call passed off as a bounded one.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
+
+use futures::future::{BoxFuture, Either};
+use futures::{FutureExt, Stream};
 
 use crate::memo::{address, digest, Encloses, Wrappers};
 use crate::timer::{self, Timer};
 use ikigai_core::{
-    Description, Endpoint, Error, Invocation, Iri, Representation, Request, Resolution, Scope,
-    Space, SpaceEntry, Topology,
+    Body, ByteStream, Bytes, Description, Endpoint, Error, Invocation, Iri, Representation,
+    Request, Resolution, Scope, Space, SpaceEntry, Topology,
 };
 
 /// A [`Space`] overlay that **bounds how long** an invocation may run. It races the
@@ -40,6 +45,12 @@ use ikigai_core::{
 /// upstream; calling it transient is the reading that was already true. A host that
 /// bounds a computation (a script, a query) should bound it with the computation's own
 /// budget, which can answer `OverBudget`, rather than with this overlay.
+///
+/// **A one-shot body is bounded to its end** (ledger #2263): the budget runs from the
+/// call to the body's last chunk, so a body still streaming when it elapses ends with the
+/// same transient [`Timeout`](Error::Timeout), never a quiet shorter body. A buffer or a
+/// body that can be read again is complete when it is handed over, and is not bounded
+/// past the call.
 pub struct Timeout<S> {
     inner: S,
     budget: Duration,
@@ -137,15 +148,31 @@ impl Encloses for TimeoutEndpoint {
     }
 }
 
+impl TimeoutEndpoint {
+    /// The refusal for having no timer.
+    fn untimed(&self) -> Error {
+        Error::Endpoint(format!(
+            "timeout: `{}` has no timer to bound it — install one with Timeout::with_timer",
+            self.target
+        ))
+    }
+
+    /// What this endpoint answers when its budget elapses.
+    fn elapsed(&self) -> Error {
+        Error::Timeout(format!(
+            "`{}` exceeded {}ms",
+            self.target,
+            self.budget.as_millis()
+        ))
+    }
+}
+
 #[async_trait::async_trait]
 impl Endpoint for TimeoutEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
         // No timer, no bound: refuse before the work starts rather than run it unbounded.
         let Some(timer) = &self.timer else {
-            return Err(Error::Endpoint(format!(
-                "timeout: `{}` has no timer to bound it — install one with Timeout::with_timer",
-                self.target
-            )));
+            return Err(self.untimed());
         };
         let work = self.inner.invoke(inv);
         let elapse = timer.sleep(self.budget);
@@ -153,13 +180,31 @@ impl Endpoint for TimeoutEndpoint {
         futures::pin_mut!(elapse);
         match futures::future::select(work, elapse).await {
             // The work finished within budget.
-            futures::future::Either::Left((result, _timer)) => result,
+            Either::Left((result, _timer)) => result,
             // The timer won — drop the in-flight work and report a transient timeout.
-            futures::future::Either::Right((_elapsed, _work)) => Err(Error::Timeout(format!(
-                "`{}` exceeded {}ms",
-                self.target,
-                self.budget.as_millis()
-            ))),
+            Either::Right((_elapsed, _work)) => Err(self.elapsed()),
+        }
+    }
+
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>, Error> {
+        let Some(timer) = self.timer.clone() else {
+            return Err(self.untimed());
+        };
+        // Owned, so the same elapse goes on bounding a one-shot body after the call.
+        let budget = self.budget;
+        let elapse: BoxFuture<'static, ()> = async move { timer.sleep(budget).await }.boxed();
+        let work = self.inner.invoke_body(inv);
+        futures::pin_mut!(work);
+        match futures::future::select(work, elapse).await {
+            Either::Left((result, elapse)) => Ok(result?.map_body(|body| match body {
+                Body::Once(stream) => Body::once(Bounded {
+                    inner: Some(stream),
+                    elapse,
+                    elapsed: self.elapsed(),
+                }),
+                complete => complete,
+            })),
+            Either::Right((_elapsed, _work)) => Err(self.elapsed()),
         }
     }
 
@@ -169,6 +214,39 @@ impl Endpoint for TimeoutEndpoint {
 
     fn describe(&self) -> Description {
         self.inner.describe()
+    }
+}
+
+/// A one-shot body under the rest of a [`Timeout`]'s budget: it ends with the timeout
+/// when the budget elapses before its last chunk.
+struct Bounded {
+    /// `None` once the body has ended.
+    inner: Option<ByteStream>,
+    elapse: BoxFuture<'static, ()>,
+    /// The error it ends with on the elapse.
+    elapsed: Error,
+}
+
+impl Stream for Bounded {
+    type Item = Result<Bytes, Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        // An end is the body's; otherwise the budget is checked on every poll, so a
+        // producer that is always ready is bounded too.
+        let polled = inner.as_mut().poll_next(cx);
+        if let Poll::Ready(None | Some(Err(_))) = polled {
+            self.inner = None;
+            return polled;
+        }
+        if self.elapse.poll_unpin(cx).is_ready() {
+            // Drop the producer now: its Drop releases whatever it holds.
+            self.inner = None;
+            return Poll::Ready(Some(Err(self.elapsed.clone())));
+        }
+        polled
     }
 }
 
