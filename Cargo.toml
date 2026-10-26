@@ -1,7 +1,7 @@
 [package]
 name = "ikigai-throttle"
 description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue idempotent failures by their failure class, from the run's shared budget), CircuitBreaker (trip open on a failing dependency), Failover (try [primary, backup, ...] on a transient or retry-after failure), Timeout (bound an invocation, transient on elapse), Throttle (cap concurrency, park the excess); logging & load-balancing later."
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -22,8 +22,11 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 # candidate is invoked on the captures ITS OWN grammar took).
 # 0.1.112: `turtle_literal`, the state face's string literals, written the one way core writes
 # Turtle (ledger #2222), so this crate needs no RDF library of its own.
-# ⚠ Under 0.x caret rules "0.1.112" is >=0.1.112, <0.2.0.
-ikigai-core = "0.1.112"
+# 0.2.0 is the streams release (ledger #2261): `Endpoint::invoke_body`, which every
+# overlay forwards (ledger #2263), ships in it. The old "0.1.112" pin meant >=0.1.112,
+# <0.2.0 under 0.x caret rules; "0.2.0" is >=0.2.0, <0.3.0. Core's types are in this
+# crate's API, so the move is this crate's 0.3.0 (ledger #2336).
+ikigai-core = "0.2.0"
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
 # Throttle parks the excess on a fair async Semaphore (runtime-agnostic).
@@ -56,22 +59,13 @@ futures-timer = "3"
 # OUTPUTS honors output_from, PIPELINE's named-only line, VALIDATE refuses a default
 # on a binding) and RECOMPUTE; 0.10.0 adds FAILURES, OFF unless a suite opts in
 # (`Suite::check_failures()`, not turned on here).
-# ⚠ `"0.10.0"` is `>=0.10.0, <0.11.0` under Cargo's 0.x rules: raise it when 0.11 ships.
-# Conformance's own floor is ikigai-core 0.1.108, below the library's 0.1.112 in
-# `[dependencies]` above, so tests build against the library's floor.
-ikigai-conformance = "0.10.0"
+# 0.11.0 is conformance on core 0.2.0 (ledger #2336), so the tests link the one core
+# the library does, and turns FAILURES and DATATYPES on by default.
+# ⚠ `"0.11.0"` is `>=0.11.0, <0.12.0` under Cargo's 0.x rules: raise it when 0.12 ships.
+ikigai-conformance = "0.11.0"
 # `tests/state.rs` parses `src/vocabulary.ttl` and the state face's Turtle, to hold the
 # face to its vocabulary (ledger #2175). Both are already in the graph through
 # ikigai-conformance. `TurtleParser::for_slice` is in every oxttl 0.2, which takes
 # oxrdf 0.3. ⚠ Each is a 0.x caret, so a ceiling too: `<0.3.0` and `<0.4.0`.
 oxttl = "0.2.0"
 oxrdf = "0.3.0"
-
-# ⚠ UNRELEASED CORE (ledger #2263): every overlay forwards `Endpoint::invoke_body`, which
-# is on ikigai-core's main (PR 247, ledger #2237) and in no published core yet: 0.1.112
-# predates it. This pins that commit until core publishes it. Before this crate's next
-# release, delete this section and raise the floor in `[dependencies]` to the core that
-# ships `invoke_body` (`cargo publish` drops a `[patch]`, and against 0.1.112 the crate
-# does not build). Ignored by every consumer's build: a `[patch]` is the root's only.
-[patch.crates-io]
-ikigai-core = { git = "https://github.com/ikigai-rs/ikigai-core", rev = "e3cce6a3fa3803dde0d25db23f4bd30d92dce6e2" }

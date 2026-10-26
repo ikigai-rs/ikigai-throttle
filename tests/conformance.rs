@@ -348,16 +348,16 @@ fn constructor(label: &str) -> &'static str {
     }
 }
 
-/// Four endpoints, five actions, nothing skipped but FAILURES (conformance 0.10's
-/// check, OFF until a suite opts in with `check_failures()`, the next wave), nothing
-/// opted out, the three declarations recorded, and the one space declared host-named.
+/// Four endpoints, five actions, nothing skipped (conformance 0.11 runs FAILURES and
+/// DATATYPES by default), nothing opted out, the three declarations recorded, and the
+/// one space declared host-named.
 fn assert_shape(label: &str, report: &Report, actions: usize) {
     assert_eq!(report.endpoints, LEAVES.len(), "{label}: {report}");
     assert_eq!(report.actions, actions, "{label}: {report}");
     assert_eq!(
-        report.checks.skipped().collect::<Vec<_>>(),
-        [Check::Failures],
-        "{label}: only FAILURES skipped: {report}"
+        report.checks.skipped().collect::<Vec<Check>>(),
+        [],
+        "{label}: nothing skipped: {report}"
     );
     assert!(report.declared.opted_out.is_empty(), "{label}: {report}");
     assert_eq!(report.declared.cacheable, ["cell", "upper"], "{label}");
