@@ -53,6 +53,16 @@ of this crate's):
   pool spent, an overlay returns the error it received. `attempts` still caps each
   `Retry` layer. A kernel with no retry budget keeps each overlay's own `attempts`.
 
+A caller that wants `Retry` or `Failover` around a stage reading an attached
+body must **spill first** (`urn:stream:spill`), using a host with a spill facility
+installed and a sufficient `urn:cap:stream:spill:<bytes>` grant. Attach the returned
+`Body::Replay` to the stage: each attempt can open it again from the beginning.
+A live `Body::Once` attachment can be read only once. Currently, a retry or
+failover after that read replaces the stage's transient error with `Conflict`
+(ledger #2471; reproduced in `tests/attached_retry.rs`). Skipping re-issue and
+preserving the original error requires a non-consuming attachment replayability
+query from core; core 0.2.3 and 0.2.4 do not expose one yet.
+
 `Timeout` stays a transient `Timeout`: it cannot tell a wait on something slow (a
 repeat may beat it) from an expensive computation (a repeat costs the same), so only
 the work itself can say `OverBudget`.
