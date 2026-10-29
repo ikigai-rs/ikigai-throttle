@@ -26,7 +26,9 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 # overlay forwards (ledger #2263), ships in it. The old "0.1.112" pin meant >=0.1.112,
 # <0.2.0 under 0.x caret rules; "0.2.0" is >=0.2.0, <0.3.0. Core's types are in this
 # crate's API, so the move is this crate's 0.3.0 (ledger #2336).
-ikigai-core = "0.2.0"
+# 0.2.5 adds `Endpoint::forwards` and `Forward`; overlays preserve forwarding
+# metadata so the kernel describes and settles inputs at the target (ledger #2537).
+ikigai-core = "0.2.5"
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
 # Throttle parks the excess on a fair async Semaphore (runtime-agnostic).

@@ -21,8 +21,8 @@ use futures::{FutureExt, Stream};
 use crate::memo::{address, digest, Encloses, Wrappers};
 use crate::timer::{self, Timer};
 use ikigai_core::{
-    Body, ByteStream, Bytes, Description, Endpoint, Error, Invocation, Iri, Representation,
-    Request, Resolution, Scope, Space, SpaceEntry, Topology,
+    Body, ByteStream, Bytes, Description, Endpoint, Error, Forward, Invocation, Iri,
+    Representation, Request, Resolution, Scope, Space, SpaceEntry, Topology,
 };
 
 /// A [`Space`] overlay that **bounds how long** an invocation may run. It races the
@@ -210,6 +210,10 @@ impl Endpoint for TimeoutEndpoint {
 
     fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    fn forwards(&self) -> Option<Forward> {
+        self.inner.forwards()
     }
 
     fn describe(&self) -> Description {

@@ -154,7 +154,7 @@ mod timeout;
 pub use timeout::Timeout;
 
 use ikigai_core::{
-    Bindings, Body, Clock, Description, Endpoint, Error, FailureClass, Invocation, Iri,
+    Bindings, Body, Clock, Description, Endpoint, Error, FailureClass, Forward, Invocation, Iri,
     Representation, Request, Resolution, Resolved, Scope, Space, SpaceEntry, Time, Topology, Verb,
 };
 use std::sync::Arc;
@@ -552,6 +552,10 @@ impl Endpoint for RateLimited {
         self.inner.name()
     }
 
+    fn forwards(&self) -> Option<Forward> {
+        self.inner.forwards()
+    }
+
     fn describe(&self) -> Description {
         self.inner.describe()
     }
@@ -791,6 +795,10 @@ impl Endpoint for RetryEndpoint {
 
     fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    fn forwards(&self) -> Option<Forward> {
+        self.inner.forwards()
     }
 
     fn describe(&self) -> Description {
@@ -1064,6 +1072,10 @@ impl Endpoint for BreakerEndpoint {
         self.inner.name()
     }
 
+    fn forwards(&self) -> Option<Forward> {
+        self.inner.forwards()
+    }
+
     fn describe(&self) -> Description {
         self.inner.describe()
     }
@@ -1323,6 +1335,20 @@ struct Candidate {
 }
 
 impl FailoverEndpoint {
+    /// Use the same candidate for the contract and its forwarding metadata. A stub
+    /// from an unreachable peer must not hide a later candidate's real contract.
+    fn described_candidate(&self) -> Option<(&Candidate, Description)> {
+        self.candidates
+            .iter()
+            .map(|candidate| (candidate, candidate.endpoint.describe()))
+            .find(|(_, description)| !description.action_specs().is_empty())
+            .or_else(|| {
+                self.candidates
+                    .first()
+                    .map(|candidate| (candidate, candidate.endpoint.describe()))
+            })
+    }
+
     /// Walk the candidates on face `F`. On the body face an advance happens only on a
     /// failure BEFORE the body is handed over: a body the answering candidate started is
     /// that candidate's, and a failure part-way through ends it for its reader.
@@ -1388,25 +1414,14 @@ impl Endpoint for FailoverEndpoint {
             .unwrap_or("failover")
     }
 
+    fn forwards(&self) -> Option<Forward> {
+        self.described_candidate()
+            .and_then(|(candidate, _)| candidate.endpoint.forwards())
+    }
+
     fn describe(&self) -> Description {
-        // The first target that can actually DESCRIBE itself — not simply the
-        // first target.
-        //
-        // A description is how the engine routes named arguments, and a mount to
-        // an unreachable peer describes itself as a bare stub (its `describe` is a
-        // best-effort wire call, and a dead peer answers nothing). Taking that stub
-        // would strip every ArgSpec the resource really has, so `source urn:fn:toUpper
-        // in=hi` would lose `in=` and pass the literal text `in=hi` as content —
-        // failover that returns a WRONG answer instead of no answer. So skip targets
-        // that declare nothing and keep looking; if none declares anything, the first
-        // one's description is as good as any.
-        let described = self
-            .candidates
-            .iter()
-            .map(|c| c.endpoint.describe())
-            .find(|d| !d.action_specs().is_empty());
-        described
-            .or_else(|| self.candidates.first().map(|c| c.endpoint.describe()))
+        self.described_candidate()
+            .map(|(_, description)| description)
             .unwrap_or_else(|| Description::new("failover"))
     }
 }
@@ -1621,6 +1636,10 @@ impl Endpoint for ThrottleEndpoint {
 
     fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    fn forwards(&self) -> Option<Forward> {
+        self.inner.forwards()
     }
 
     fn describe(&self) -> Description {
@@ -1867,7 +1886,9 @@ mod tests {
     /// a wrong answer, which is worse than no answer.
     #[test]
     fn a_failover_describes_itself_by_a_target_that_declares_something() {
-        struct Real;
+        struct Real {
+            forward: bool,
+        }
         #[async_trait::async_trait]
         impl Endpoint for Real {
             async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation, Error> {
@@ -1875,6 +1896,10 @@ mod tests {
                     ReprType::new("text/plain"),
                     b"ok".to_vec(),
                 ))
+            }
+            fn forwards(&self) -> Option<Forward> {
+                self.forward
+                    .then(|| Forward::new("urn:x", Iri::parse("urn:target").unwrap()))
             }
             fn describe(&self) -> Description {
                 Description::new("real").verb(Verb::Source)
@@ -1885,10 +1910,10 @@ mod tests {
             bindings: Bindings::new(),
             space,
         };
-        let failover = FailoverEndpoint {
+        let mut failover = FailoverEndpoint {
             candidates: vec![
                 candidate(Arc::new(Unreachable), 0),
-                candidate(Arc::new(Real), 1),
+                candidate(Arc::new(Real { forward: true }), 1),
             ],
             target: "urn:x".to_string(),
             routes: Arc::default(),
@@ -1897,6 +1922,19 @@ mod tests {
         assert!(
             !failover.describe().action_specs().is_empty(),
             "the live target's contract must survive a dead primary"
+        );
+
+        assert_eq!(
+            failover.forwards(),
+            Real { forward: true }.forwards(),
+            "forwarding metadata comes from the candidate that supplies the contract"
+        );
+        failover
+            .candidates
+            .insert(0, candidate(Arc::new(Real { forward: false }), 2));
+        assert!(
+            failover.forwards().is_none(),
+            "a concrete primary must not inherit a backup's forwarding metadata"
         );
     }
 
