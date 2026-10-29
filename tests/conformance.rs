@@ -349,7 +349,7 @@ fn constructor(label: &str) -> &'static str {
 }
 
 /// Four endpoints, five actions, nothing skipped (conformance 0.11 runs FAILURES and
-/// DATATYPES by default), nothing opted out, the three declarations recorded, and the
+/// DATATYPES by default, 0.12 BODIES and BODY-INPUTS), nothing opted out, the three declarations recorded, and the
 /// one space declared host-named.
 fn assert_shape(label: &str, report: &Report, actions: usize) {
     assert_eq!(report.endpoints, LEAVES.len(), "{label}: {report}");
@@ -374,6 +374,35 @@ fn assert_shape(label: &str, report: &Report, actions: usize) {
         [(constructor(label), SpaceNaming::HostNamed)],
         "{label}: {report}"
     );
+}
+
+/// BODIES (conformance 0.12) compares each deterministic `Source`'s `invoke` with its
+/// collected `invoke_body` IN the space the kernel was built from (`Suite::body_space`,
+/// the same `Arc`), then requires `OverBudget` from a kernel body collect one byte
+/// short. Without the space every Source is `unprobed`, not passing, so this pins the
+/// wiring: `cell` and `upper` (the cacheable reads) are probed, and the only actions
+/// left unprobed are the two uncacheable reads, `live` (a counter) and `gated` (no
+/// expiry stated, so `Always`), each with the suite's own volatile-answer reason. No
+/// fixture argument is declared `reads_body`, so BODY-INPUTS has nothing to probe and
+/// needs no content store.
+fn assert_bodies_probed(label: &str, report: &Report) {
+    let mut unprobed: Vec<(&str, Verb, Check)> = report
+        .unprobed
+        .iter()
+        .map(|u| (u.endpoint.as_str(), u.verb, u.check))
+        .collect();
+    unprobed.sort_unstable_by_key(|(endpoint, _, _)| *endpoint);
+    assert_eq!(
+        unprobed,
+        [
+            ("gated", Verb::Source, Check::Bodies),
+            ("live", Verb::Source, Check::Bodies),
+        ],
+        "{label}: only the uncacheable reads are left unprobed: {report}"
+    );
+    for u in report.unprobed.iter() {
+        assert!(u.reason.contains("uncacheable"), "{label}: {report}");
+    }
 }
 
 fn request(verb: Verb, iri: &str, args: &[(&str, &str)]) -> Request {
@@ -409,11 +438,13 @@ fn none() -> Capability {
 fn conforms() {
     // The bare fixture is not one of this crate's constructors, so it declares no
     // space: the report says SPACE-NAME checked none.
-    let bare = Kernel::new(Leaf::new().space());
-    let report = suite().run_blocking(&bare);
+    let space = Leaf::new().space();
+    let bare = Kernel::new(Arc::clone(&space));
+    let report = suite().body_space(space).run_blocking(&bare);
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("bare: {report}");
     report.assert_clean();
+    assert_bodies_probed("bare", &report);
     assert_eq!(report.endpoints, LEAVES.len(), "bare: {report}");
     assert_eq!(report.actions, 5, "bare: {report}");
     assert!(report.declared.spaces.is_empty(), "bare: {report}");
@@ -422,11 +453,13 @@ fn conforms() {
         let space = compose(Leaf::new().space());
         let kernel = Kernel::new(Arc::clone(&space));
         let report = suite()
-            .host_named_space(constructor(label), space)
+            .host_named_space(constructor(label), Arc::clone(&space))
+            .body_space(space)
             .run_blocking(&kernel);
         eprintln!("{label}: {report}");
         report.assert_clean();
         assert_shape(label, &report, 5);
+        assert_bodies_probed(label, &report);
     }
 
     let leaf = Leaf::new();
@@ -438,11 +471,13 @@ fn conforms() {
     );
     let kernel = Kernel::new(Arc::clone(&mirrored));
     let report = suite()
-        .host_named_space(constructor("Failover"), mirrored)
+        .host_named_space(constructor("Failover"), Arc::clone(&mirrored))
+        .body_space(mirrored)
         .run_blocking(&kernel);
     eprintln!("Failover over mirrors: {report}");
     report.assert_clean();
     assert_shape("Failover", &report, 5);
+    assert_bodies_probed("Failover over mirrors", &report);
     assert_eq!(
         report.collapsed.len(),
         5,

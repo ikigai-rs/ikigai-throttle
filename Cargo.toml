@@ -65,8 +65,12 @@ futures-timer = "3"
 # (`Suite::check_failures()`, not turned on here).
 # 0.11.0 is conformance on core 0.2.0 (ledger #2336), so the tests link the one core
 # the library does, and turns FAILURES and DATATYPES on by default.
-# ⚠ `"0.11.0"` is `>=0.11.0, <0.12.0` under Cargo's 0.x rules: raise it when 0.12 ships.
-ikigai-conformance = "0.11.0"
+# 0.12.0 turns BODIES and BODY-INPUTS on by default (ledger #2593): the walk hands the
+# suite the same `Arc` the kernel was built from (`Suite::body_space`), so each cacheable
+# Source's `invoke` and `invoke_body` are compared THROUGH every overlay. No fixture
+# argument is declared `reads_body`, so BODY-INPUTS needs no content store here.
+# ⚠ `"0.12.0"` is `>=0.12.0, <0.13.0` under Cargo's 0.x rules: raise it when 0.13 ships.
+ikigai-conformance = "0.12.0"
 # `tests/state.rs` parses `src/vocabulary.ttl` and the state face's Turtle, to hold the
 # face to its vocabulary (ledger #2175). Both are already in the graph through
 # ikigai-conformance. `TurtleParser::for_slice` is in every oxttl 0.2, which takes
