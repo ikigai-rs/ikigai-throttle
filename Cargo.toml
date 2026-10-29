@@ -1,7 +1,9 @@
 [package]
 name = "ikigai-throttle"
 description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue idempotent failures by their failure class, from the run's shared budget), CircuitBreaker (trip open on a failing dependency), Failover (try [primary, backup, ...] on a transient or retry-after failure), Timeout (bound an invocation, transient on elapse), Throttle (cap concurrency, park the excess); logging & load-balancing later."
-version = "0.3.0"
+# 0.3.1 (ledger #2537): every overlay passes `Endpoint::forwards()` through, so a view behind one
+# is described by its target's contract; the core floor rises to 0.2.5, where `forwards()` lands.
+version = "0.3.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
