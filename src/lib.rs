@@ -712,6 +712,19 @@ fn repeat(error: &Error, verb: Verb) -> Repeat {
     }
 }
 
+/// A re-issue must be able to reopen every attached input, even if the failed
+/// attempt already took its one-shot body. Check before spending or waiting.
+fn attachments_allow_reissue(inv: &Invocation<'_>) -> bool {
+    if inv.attachments_reopenable() {
+        return true;
+    }
+    inv.trace_note(
+        "retry_skipped",
+        "one-shot attachment: retry skipped; spill first (urn:stream:spill) to make it retryable",
+    );
+    false
+}
+
 /// Spend one retry from the run's pool, when the run carries one. `true` with no pool:
 /// the overlay's own bound (`attempts`, or the candidate list) is then the whole bound.
 fn spend(inv: &Invocation<'_>) -> bool {
@@ -771,6 +784,9 @@ impl RetryEndpoint {
                 Repeat::After(delay) if self.fits(delay, inv) => Some(delay),
                 Repeat::After(_) | Repeat::Never => return Err(error),
             };
+            if !attachments_allow_reissue(inv) {
+                return Err(error);
+            }
             // Spend BEFORE waiting, so an empty pool never costs a wait.
             if !spend(inv) {
                 return Err(error);
@@ -1379,7 +1395,7 @@ impl FailoverEndpoint {
                 Err(e) if i < last && advances(&e, inv.request.verb) => {
                     // This target is down or limited: try the next, if the run can
                     // afford another issue.
-                    if !spend(inv) {
+                    if !attachments_allow_reissue(inv) || !spend(inv) {
                         self.ended(candidate, false);
                         return Err(e);
                     }

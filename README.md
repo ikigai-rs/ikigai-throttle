@@ -53,6 +53,15 @@ of this crate's):
   pool spent, an overlay returns the error it received. `attempts` still caps each
   `Retry` layer. A kernel with no retry budget keeps each overlay's own `attempts`.
 
+`Retry` and `Failover` re-issue only when every attached input body can reopen.
+A live `Body::Once` attachment skips the retry or failover advance: the overlay
+returns the original error, spends no retry budget, waits for no delay, and records
+a trace note explaining the one-shot attachment. A caller who wants retries over
+a live body must **spill first** (`urn:stream:spill`), using a host with a spill
+facility installed and a sufficient `urn:cap:stream:spill:<bytes>` grant. Attach
+the returned `Body::Replay` to the stage so every attempt can open it again.
+Buffered attachments and requests without attachments retain their retry behavior.
+
 `Timeout` stays a transient `Timeout`: it cannot tell a wait on something slow (a
 repeat may beat it) from an expensive computation (a repeat costs the same), so only
 the work itself can say `OverBudget`.
