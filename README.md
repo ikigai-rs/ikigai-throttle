@@ -323,6 +323,12 @@ overlay exactly as it is bare.
 - Still to come: logging, egress-filtering, and load-balancing overlays. Same
   shape, every one.
 
+## Accessibility
+
+What people read from this crate is the governors' state face and the refusals the overlays
+answer, all plain text. [ACCESSIBILITY.md](ACCESSIBILITY.md) says what that text is, the rules
+it follows, what is not tested, and how to report a barrier.
+
 ## License
 
 MIT OR Apache-2.0.
