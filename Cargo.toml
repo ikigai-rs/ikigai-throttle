@@ -1,9 +1,8 @@
 [package]
 name = "ikigai-throttle"
 description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue idempotent failures by their failure class, from the run's shared budget), CircuitBreaker (trip open on a failing dependency), Failover (try [primary, backup, ...] on a transient or retry-after failure), Timeout (bound an invocation, transient on elapse), Throttle (cap concurrency, park the excess); logging & load-balancing later."
-# 0.3.1 (ledger #2537): every overlay passes `Endpoint::forwards()` through, so a view behind one
-# is described by its target's contract; the core floor rises to 0.2.5, where `forwards()` lands.
-version = "0.3.1"
+# 0.4.0: the public API now uses core 0.3 types (scoped content store, ledger #2965).
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -31,7 +30,9 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 # 0.2.5 adds `Endpoint::forwards` and `Forward`; overlays preserve forwarding
 # metadata so the kernel describes and settles inputs at the target (ledger #2537).
 # 0.2.8 adds `Invocation::attachments_reopenable`, checked before Retry/Failover re-issue.
-ikigai-core = "0.2.8"
+# 0.3.0 scopes held content to its deliverer; principal-less holds belong to root,
+# and ContentStore::put/put_replay are root-only (ledger #2965).
+ikigai-core = "0.3.0"
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
 # Throttle parks the excess on a fair async Semaphore (runtime-agnostic).
@@ -70,8 +71,9 @@ futures-timer = "3"
 # suite the same `Arc` the kernel was built from (`Suite::body_space`), so each cacheable
 # Source's `invoke` and `invoke_body` are compared THROUGH every overlay. No fixture
 # argument is declared `reads_body`, so BODY-INPUTS needs no content store here.
-# ⚠ `"0.12.0"` is `>=0.12.0, <0.13.0` under Cargo's 0.x rules: raise it when 0.13 ships.
-ikigai-conformance = "0.12.0"
+# 0.14.0 uses core 0.3.0 and its scoped content store (ledger #2965), matching
+# the core types exposed by this crate.
+ikigai-conformance = "0.14.0"
 # `tests/state.rs` parses `src/vocabulary.ttl` and the state face's Turtle, to hold the
 # face to its vocabulary (ledger #2175). Both are already in the graph through
 # ikigai-conformance. `TurtleParser::for_slice` is in every oxttl 0.2, which takes
