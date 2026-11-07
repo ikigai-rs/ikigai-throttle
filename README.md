@@ -3,7 +3,7 @@
 **Reliability interception overlays** for [ikigai](https://github.com/ikigai-rs).
 
 An *interception overlay* is a [`Space`] that wraps another `Space`, adding
-cross-cutting behaviour to every resolution that flows through it without the
+cross-cutting behavior to every resolution that flows through it without the
 wrapped space knowing. It's the substrate's composition primitive turned to
 reliability: the same shape you'd reach for as middleware, but as a resource
 resolver you stack in front of anything — a leaf space, a `Fallback`, a remote
