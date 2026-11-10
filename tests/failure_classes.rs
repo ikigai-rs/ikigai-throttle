@@ -20,6 +20,12 @@ use ikigai_core::{
 };
 use ikigai_throttle::{CircuitBreaker, Failover, Rate, RateLimit, Retry, Timer};
 
+// These tests isolate failure-class and shared-pool decisions. Timing policy is
+// covered separately with deterministic jitter in retry_policy.rs.
+fn retry<S: Space>(inner: S, attempts: u32) -> Retry<S> {
+    Retry::new(inner, attempts).with_backoff(Duration::ZERO, Duration::ZERO)
+}
+
 /// A clock that moves only when the test (or the timer) moves it.
 #[derive(Clone, Default)]
 struct Manual(Arc<AtomicU64>);
@@ -162,7 +168,7 @@ fn every_class_is_represented() {
     );
 }
 
-/// Retry: a transient failure is re-issued at once, a retry-after one after its delay
+/// Retry with backoff disabled: a transient failure is re-issued at once, a retry-after one after its delay
 /// (it fits the overlay's own bound here), and every other class is returned on the
 /// first attempt. A `Sink` is never re-sent, whatever the class.
 #[test]
@@ -171,7 +177,8 @@ fn retry_decides_from_each_class() {
         let clock = Manual::at(1_000);
         let timer = Advancing::on(&clock);
         let (space, seen) = failing(&error);
-        let retry = Retry::new(space, 3)
+        let retry = retry(space, 3)
+            .with_clock(Arc::new(clock.clone()))
             .with_timer(Arc::new(timer.clone()))
             .with_max_wait(Duration::from_secs(60));
         let kernel = Kernel::new(Arc::new(retry)).with_clock(Arc::new(clock.clone()));
@@ -264,7 +271,7 @@ fn a_breaker_counts_only_transient_failures() {
 /// the whole tree makes the first call and 2 re-issues, wherever they happen.
 #[test]
 fn nested_retry_layers_spend_one_pool_never_multiplying() {
-    let nested = |space: EndpointSpace| Retry::new(Retry::new(space, 3), 3);
+    let nested = |space: EndpointSpace| retry(retry(space, 3), 3);
     let down = Error::Unavailable("down".into());
 
     // No pool configured: each layer's own attempts, as before.
@@ -316,12 +323,12 @@ fn nested_retry_layers_spend_one_pool_never_multiplying() {
 #[test]
 fn a_spent_pool_returns_the_received_error() {
     let (space, seen) = failing_for(&Error::Timeout("slow".into()), 1);
-    let kernel = Kernel::new(Arc::new(Retry::new(space, 5))).with_retry_budget(0, 0);
+    let kernel = Kernel::new(Arc::new(retry(space, 5))).with_retry_budget(0, 0);
     assert_eq!(read(&kernel).unwrap_err(), Error::Timeout("slow".into()));
     assert_eq!(seen.load(Ordering::SeqCst), 1);
 
     let (space, seen) = failing_for(&Error::Timeout("slow".into()), 1);
-    let kernel = Kernel::new(Arc::new(Retry::new(space, 5))).with_retry_budget(0, 1);
+    let kernel = Kernel::new(Arc::new(retry(space, 5))).with_retry_budget(0, 1);
     assert!(read(&kernel).is_ok(), "one retry was enough");
     assert_eq!(seen.load(Ordering::SeqCst), 2);
 }
@@ -351,7 +358,8 @@ fn failover_advances_spend_from_the_pool() {
 
 /// ★ A RetryAfter is waited only when its delay fits what the run has left. The door set
 /// a deadline 100 ms out: a 500 ms delay is returned at once and never waited; a 50 ms
-/// delay is waited twice (time left 100, then 50), and a third wait would not fit.
+/// delay is waited twice (time left 100, then 50), then the overall deadline ends it
+/// without starting a third attempt.
 #[test]
 fn a_retry_after_longer_than_the_time_left_is_not_waited() {
     let run = |delay_ms: u64, retry: fn(EndpointSpace) -> Retry<EndpointSpace>| {
@@ -362,18 +370,30 @@ fn a_retry_after_longer_than_the_time_left_is_not_waited() {
             detail: "limited".into(),
         };
         let (space, seen) = failing(&error);
-        let kernel = Kernel::new(Arc::new(retry(space).with_timer(Arc::new(timer.clone()))))
-            .with_clock(Arc::new(clock.clone()));
+        let kernel = Kernel::new(Arc::new(
+            retry(space)
+                .with_clock(Arc::new(clock.clone()))
+                .with_timer(Arc::new(timer.clone())),
+        ))
+        .with_clock(Arc::new(clock.clone()));
         let deadline = IssueContext::new().with_not_after(Time::from_millis(1_100));
         let out = block_on(kernel.issue_with_context(
             request(Verb::Source),
             &Capability::root(),
             deadline,
         ));
-        assert_eq!(out.unwrap_err(), error, "the received error, unchanged");
+        let err = out.unwrap_err();
+        if timer.waits().len() == 2 {
+            assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+        } else {
+            assert_eq!(
+                err, error,
+                "a delay that does not fit is returned unchanged"
+            );
+        }
         (seen.load(Ordering::SeqCst), timer.waits())
     };
-    let plain = |space| Retry::new(space, 5);
+    let plain = |space| retry(space, 5);
 
     let (seen, waits) = run(500, plain);
     assert_eq!(
@@ -383,7 +403,7 @@ fn a_retry_after_longer_than_the_time_left_is_not_waited() {
     );
 
     let (seen, waits) = run(50, plain);
-    assert_eq!(seen, 3);
+    assert_eq!(seen, 2, "no attempt starts at the overall deadline");
     assert_eq!(
         waits,
         vec![Duration::from_millis(50); 2],
@@ -391,7 +411,7 @@ fn a_retry_after_longer_than_the_time_left_is_not_waited() {
     );
 
     // An own bound only LOWERS a deadline: 10 ms of own bound refuses a 50 ms wait.
-    let bounded = |space| Retry::new(space, 5).with_max_wait(Duration::from_millis(10));
+    let bounded = |space| retry(space, 5).with_max_wait(Duration::from_millis(10));
     let (seen, waits) = run(50, bounded);
     assert_eq!((seen, waits), (1, vec![]));
 }
@@ -420,7 +440,9 @@ fn without_a_deadline_the_own_bound_decides() {
     ] {
         let clock = Manual::at(0);
         let (space, seen) = failing(&limited(delay));
-        let mut retry = Retry::new(space, 2).with_timer(Arc::new(Advancing::on(&clock)));
+        let mut retry = retry(space, 2)
+            .with_clock(Arc::new(clock.clone()))
+            .with_timer(Arc::new(Advancing::on(&clock)));
         if let Some(bound) = bound {
             retry = retry.with_max_wait(bound);
         }
@@ -445,7 +467,7 @@ fn an_over_budget_failure_is_never_reissued() {
 
     let (space, seen) = failing(&over);
     let kernel = generous(Kernel::new(Arc::new(
-        Retry::new(space, 10).with_max_wait(Duration::from_secs(60)),
+        retry(space, 10).with_max_wait(Duration::from_secs(60)),
     )));
     assert_eq!(read(&kernel).unwrap_err(), over);
     assert_eq!(seen.load(Ordering::SeqCst), 1, "Retry: once");
@@ -465,8 +487,8 @@ fn an_over_budget_failure_is_never_reissued() {
 
     // The README's stack, under a breaker that would trip on one transient failure.
     let (space, seen) = failing(&over);
-    let stack = Retry::new(
-        CircuitBreaker::new(Retry::new(space, 10), 1, Duration::from_secs(30)),
+    let stack = retry(
+        CircuitBreaker::new(retry(space, 10), 1, Duration::from_secs(30)),
         10,
     );
     let kernel = generous(Kernel::new(Arc::new(stack)));
@@ -514,7 +536,8 @@ fn a_retry_waits_out_a_rate_limit_and_gets_through() {
     let limited = RateLimit::new(space)
         .limit("urn:", Rate::new(1, Duration::from_millis(100)))
         .with_clock(Arc::new(clock.clone()));
-    let retry = Retry::new(limited, 2)
+    let retry = retry(limited, 2)
+        .with_clock(Arc::new(clock.clone()))
         .with_timer(Arc::new(timer.clone()))
         .with_max_wait(Duration::from_secs(1));
     let kernel = Kernel::new(Arc::new(retry)).with_clock(Arc::new(clock.clone()));
@@ -538,7 +561,8 @@ fn a_retry_waits_out_an_open_circuit() {
     let (space, seen) = failing_for(&Error::Unavailable("blip".into()), 1);
     let breaker = CircuitBreaker::new(space, 1, Duration::from_millis(100))
         .with_clock(Arc::new(clock.clone()));
-    let retry = Retry::new(breaker, 3)
+    let retry = retry(breaker, 3)
+        .with_clock(Arc::new(clock.clone()))
         .with_timer(Arc::new(timer.clone()))
         .with_max_wait(Duration::from_secs(1));
     let kernel = Kernel::new(Arc::new(retry)).with_clock(Arc::new(clock));

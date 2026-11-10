@@ -26,7 +26,9 @@ This is a library of overlays a host stacks around its spaces.
   `urn:x` `` (both `RetryAfter`, whose display core prefixes with the delay), a timeout
   (`` `urn:x` exceeded 500ms ``), `no failover target resolved the request`, and, when a host
   gave an overlay no clock or timer, a sentence naming the builder that installs one
-  (`install one with RateLimit::with_clock`).
+  (`install one with RateLimit::with_clock`). Retry also refuses a missing clock or
+  timer, naming `Retry::with_clock` and `Retry::with_timer`; an overall retry timeout
+  names the target, the number of attempts, and elapsed milliseconds.
 - **Refusals from the state face**: an unknown face (`as=`), a governor name that is not
   allowed, or one already observed, each an `InvalidArgument` naming the argument with a
   sentence; a governor that does not exist or that the caller may not read is the same
@@ -93,8 +95,13 @@ technology you used, if you are comfortable sharing them. Anything security-sens
 through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-throttle/security/advisories/new).
 **We acknowledge a report within 7 days**, and promise nothing further.
 
+Retry timing and refusal tests in `tests/retry_policy.rs` and the unit tests use
+injected clocks/timers. They check timeout type, target naming, and the missing
+facility builders. No browser or assistive technology was used for these changes.
+
 ## Change history
 
 | Date | Change |
 |---|---|
 | 2026-10-31 | First version. |
+| 2026-11-10 | Document retry overall-limit and missing-facility refusals. |

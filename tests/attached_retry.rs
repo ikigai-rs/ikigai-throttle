@@ -94,6 +94,7 @@ fn observed_fixture(
     } else {
         Arc::new(
             Retry::new(leaf(), 3)
+                .with_backoff(Duration::ZERO, Duration::ZERO)
                 .with_timer(Arc::new(NoWait))
                 .with_max_wait(Duration::from_secs(1)),
         )
