@@ -42,10 +42,10 @@
 //! through a governor to the doors it guards. [`Failover`], enclosing several,
 //! is reported opaque; see its `topology`.
 //!
-//! **Time comes from a core [`Clock`]**, never from the platform directly. The two
-//! governors that measure time, [`RateLimit`] (its window) and [`CircuitBreaker`]
-//! (its cooldown), read the clock they were given with `with_clock`, and default to
-//! a monotonic clock on a native target. On wasm32-unknown-unknown, where Rust's own
+//! **Time comes from a core [`Clock`]**, never from the platform directly. The
+//! governors measuring windows and cooldowns, [`RateLimit`] and [`CircuitBreaker`],
+//! and [`Retry`] measuring its overall limit, read the clock given with `with_clock`.
+//! They default to a monotonic clock on a native target. On wasm32-unknown-unknown, where Rust's own
 //! platform time panics (a browser has a clock, but only behind JavaScript imports this
 //! library does not make), there is no default: the host installs a clock as it does
 //! for its kernel, and a governor without one refuses rather than guessing.
@@ -122,7 +122,9 @@ use body::{on_end, Face};
 mod memo;
 use memo::{address, digest, Encloses, Wrappers};
 
+mod jitter;
 mod timer;
+pub use jitter::{FullJitter, Jitter};
 pub use timer::Timer;
 
 mod state;
@@ -570,7 +572,7 @@ impl Endpoint for RateLimited {
 /// What it does with each [`FailureClass`] it RECEIVES:
 ///
 /// - **transient** ([`Timeout`](Error::Timeout), [`Unavailable`](Error::Unavailable)):
-///   re-issue at once.
+///   re-issue after capped exponential backoff with full jitter.
 /// - **retry-after** ([`RetryAfter`](Error::RetryAfter)): wait the delay on its
 ///   [`Timer`] and re-issue, but only when the delay is known and fits: at most the
 ///   run's [`time_left`](Invocation::time_left) when the door set a deadline, and at
@@ -588,7 +590,17 @@ impl Endpoint for RateLimited {
 /// re-issue, and returns the error it received when none is left, so nested `Retry`
 /// layers spend one pool instead of multiplying their attempts. `attempts` then caps
 /// this layer under the pool. With no pool (a kernel that configured none), `attempts`
-/// alone bounds it, as before.
+/// caps the number of calls. All attempts and waits also share a 30-second overall
+/// limit by default ([`with_time_limit`](Self::with_time_limit)). Backoff starts at
+/// 100 ms and doubles to a 10-second cap ([`with_backoff`](Self::with_backoff)); full
+/// jitter samples uniformly from zero through that cap at millisecond resolution
+/// to spread callers across the window instead of synchronizing their retries.
+/// A RetryAfter delay is a minimum and is never shortened by jitter or the cap.
+///
+/// Core 0.3 cannot carry structured retry-exhaustion fields: attempt exhaustion
+/// still returns the last error; an overall elapse returns [`Error::Timeout`].
+/// Structured attempts/elapsed errors and contract-declared Sink resend safety
+/// require a core API addition. Until then every Sink remains excluded.
 ///
 /// ```
 /// use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
@@ -618,6 +630,11 @@ pub struct Retry<S> {
     timer: Option<Arc<dyn Timer>>,
     /// The longest delay waited when the run has no deadline.
     max_wait: Option<Duration>,
+    clock: Option<Arc<dyn Clock>>,
+    initial_delay: Duration,
+    maximum_delay: Duration,
+    time_limit: Duration,
+    jitter: Arc<dyn Jitter>,
     /// One wrapper per inner endpoint: see [`memo`].
     wrappers: Wrappers<usize, RetryEndpoint>,
 }
@@ -631,13 +648,49 @@ impl<S: Space> Retry<S> {
             attempts: attempts.max(1),
             timer: timer::default_timer(),
             max_wait: None,
+            clock: default_clock(),
+            initial_delay: Duration::from_millis(100),
+            maximum_delay: Duration::from_secs(10),
+            time_limit: Duration::from_secs(30),
+            jitter: Arc::new(FullJitter::default()),
             wrappers: Wrappers::new(),
         }
     }
 
+    /// Measure elapsed time with the kernel's clock. Tests should install the same
+    /// clock in their timer and kernel. Configure before the first resolution.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Start exponential backoff at `initial`, doubling up to `maximum`.
+    /// Full jitter samples from zero through that cap. Defaults: 100 ms and 10 s.
+    /// An initial delay above the maximum is clamped; zero disables backoff.
+    pub fn with_backoff(mut self, initial: Duration, maximum: Duration) -> Self {
+        self.initial_delay = initial.min(maximum);
+        self.maximum_delay = maximum;
+        self
+    }
+
+    /// Bound all attempts and waits together, including an in-flight async call.
+    /// Defaults to 30 seconds; the run's remaining time can only lower this bound.
+    /// Like Timeout, this cannot interrupt synchronous work that never yields.
+    pub fn with_time_limit(mut self, limit: Duration) -> Self {
+        self.time_limit = limit;
+        self
+    }
+
+    /// Replace full jitter, for example with a deterministic test sampler.
+    /// Answers are clamped to the current exponential cap.
+    pub fn with_jitter(mut self, jitter: Arc<dyn Jitter>) -> Self {
+        self.jitter = jitter;
+        self
+    }
+
     /// Wait out [`RetryAfter`](Error::RetryAfter) delays on `timer` (builder), instead
     /// of the default: futures-timer on a native target, and **none on wasm32**, where
-    /// a `Retry` without a timer returns every `RetryAfter` unchanged. A test hands it a
+    /// a `Retry` without a timer refuses before starting work. A test hands it a
     /// timer that moves the test's clock. Call it before the first resolution: a wrapper
     /// built by then keeps the timer it was built with.
     pub fn with_timer(mut self, timer: Arc<dyn Timer>) -> Self {
@@ -666,6 +719,11 @@ impl<S: Space> Space for Retry<S> {
                     attempts: self.attempts,
                     timer: self.timer.clone(),
                     max_wait: self.max_wait,
+                    clock: self.clock.clone(),
+                    initial_delay: self.initial_delay,
+                    maximum_delay: self.maximum_delay,
+                    time_limit: self.time_limit,
+                    jitter: self.jitter.clone(),
                 },
             ) as Arc<dyn Endpoint>
         })
@@ -686,7 +744,7 @@ impl<S: Space> Space for Retry<S> {
 
 /// When a failure may be repeated, by the class core gives it.
 enum Repeat {
-    /// Re-issue now (transient).
+    /// Re-issue with backoff (transient).
     Now,
     /// Re-issue after this delay (retry-after, with a known delay).
     After(Duration),
@@ -738,6 +796,11 @@ struct RetryEndpoint {
     attempts: u32,
     timer: Option<Arc<dyn Timer>>,
     max_wait: Option<Duration>,
+    clock: Option<Arc<dyn Clock>>,
+    initial_delay: Duration,
+    maximum_delay: Duration,
+    time_limit: Duration,
+    jitter: Arc<dyn Jitter>,
 }
 
 impl RetryEndpoint {
@@ -770,31 +833,76 @@ impl RetryEndpoint {
     /// replayed, so a failure part-way through ends the body for its reader (and a
     /// breaker below counts it).
     async fn attempts<F: Face>(&self, inv: &Invocation<'_>) -> Result<F, Error> {
-        let mut attempt = 1;
+        let (Some(clock), Some(timer)) = (&self.clock, &self.timer) else {
+            return Err(Error::Endpoint(format!(
+                "retry: `{}` needs a clock and timer — install them with Retry::with_clock and Retry::with_timer",
+                inv.request.target
+            )));
+        };
+        let start = clock.now();
+        let elapsed =
+            || Duration::from_millis(clock.now().as_millis().saturating_sub(start.as_millis()));
+        let remaining = || {
+            let own = self.time_limit.saturating_sub(elapsed());
+            inv.time_left().map_or(own, |left| own.min(left))
+        };
+        let exhausted = |attempt| {
+            Error::Timeout(format!(
+                "retry: `{}` exceeded its overall time limit after {attempt} attempts and {} ms",
+                inv.request.target,
+                elapsed().as_millis()
+            ))
+        };
+        let mut attempt = 0;
+        let mut cap = self.initial_delay;
         loop {
-            let error = match F::call(&*self.inner, inv).await {
-                Ok(representation) => return Ok(representation),
-                Err(error) => error,
+            let left = remaining();
+            if left.is_zero() {
+                return Err(exhausted(attempt));
+            }
+            attempt += 1;
+            let work = F::call(&*self.inner, inv);
+            let deadline = timer.sleep(left);
+            futures::pin_mut!(work, deadline);
+            let error = match futures::future::select(work, deadline).await {
+                futures::future::Either::Left((Ok(representation), _)) => {
+                    return if remaining().is_zero() {
+                        Err(exhausted(attempt))
+                    } else {
+                        Ok(representation)
+                    };
+                }
+                futures::future::Either::Left((Err(error), _)) => error,
+                futures::future::Either::Right(_) => return Err(exhausted(attempt)),
             };
+            if remaining().is_zero() {
+                return Err(exhausted(attempt));
+            }
             if attempt >= self.attempts {
                 return Err(error);
             }
-            let wait = match repeat(&error, inv.request.verb) {
-                Repeat::Now => None,
-                Repeat::After(delay) if self.fits(delay, inv) => Some(delay),
+            let minimum = match repeat(&error, inv.request.verb) {
+                Repeat::Now => Duration::ZERO,
+                Repeat::After(delay) if self.fits(delay, inv) => delay,
                 Repeat::After(_) | Repeat::Never => return Err(error),
             };
             if !attachments_allow_reissue(inv) {
                 return Err(error);
             }
-            // Spend BEFORE waiting, so an empty pool never costs a wait.
+            // Spend BEFORE sampling or waiting, so an empty pool costs neither.
             if !spend(inv) {
                 return Err(error);
             }
-            if let (Some(delay), Some(timer)) = (wait, &self.timer) {
+            let delay = self.jitter.sample(cap).min(cap).max(minimum);
+            cap = cap.saturating_mul(2).min(self.maximum_delay);
+            let left = remaining();
+            if delay >= left {
+                timer.sleep(left).await;
+                return Err(exhausted(attempt));
+            }
+            if !cap.is_zero() || !delay.is_zero() {
                 timer.sleep(delay).await;
             }
-            attempt += 1;
         }
     }
 }
@@ -841,6 +949,12 @@ struct Breaker {
 /// dependency is limited, not broken, and over-budget, denied, refused, permanent and
 /// unknown failures say nothing about its health. Sibling of [`RateLimit`] and
 /// [`Retry`]; its trip-open is the fast trigger a Failover reads.
+///
+/// **Sharing across mounts:** combine the governed spaces in a core [`Fallback`](ikigai_core::Fallback),
+/// wrap that once, and hand clones of one `Arc<CircuitBreaker<_>>` to every mount.
+/// Every clone reaches the same per-target circuits; constructing a new breaker for
+/// each mount would give each one independent failure counts and cooldowns.
+/// See the README's complete host wiring example.
 ///
 /// ★ **The open circuit answers [`Error::RetryAfter`]** (since 0.2.0, ledger #1546),
 /// with the cooldown left as its delay: a [`Retry`] above waits it out (when it fits
@@ -2183,41 +2297,39 @@ mod tests {
 
     #[test]
     fn times_out_slow_work_but_lets_fast_work_through() {
-        struct Slow {
-            delay: Duration,
+        struct Work {
+            ready: bool,
+        }
+        struct Immediate;
+        #[async_trait::async_trait]
+        impl Timer for Immediate {
+            async fn sleep(&self, _: Duration) {}
         }
         #[async_trait::async_trait]
-        impl Endpoint for Slow {
+        impl Endpoint for Work {
             async fn invoke(&self, _inv: &Invocation<'_>) -> Result<Representation, Error> {
-                futures_timer::Delay::new(self.delay).await;
+                if !self.ready {
+                    futures::future::pending::<()>().await;
+                }
                 Ok(Representation::new(
                     ReprType::new("text/plain"),
                     b"ok".to_vec(),
                 ))
             }
         }
-        let over = |delay, budget| {
-            let space =
-                EndpointSpace::new().bind_arc(Exact::new("urn:slow"), Arc::new(Slow { delay }));
-            Kernel::new(Arc::new(Timeout::new(space, budget)))
+        let over = |ready| {
+            let space = EndpointSpace::new().bind(Exact::new("urn:slow"), Work { ready });
+            Kernel::new(Arc::new(
+                Timeout::new(space, Duration::from_millis(10)).with_timer(Arc::new(Immediate)),
+            ))
         };
         let req = || Request::new(Verb::Source, Iri::parse("urn:slow").unwrap());
-
-        // Work slower than the budget → a transient Timeout.
-        let err = block_on(
-            over(Duration::from_millis(60), Duration::from_millis(10))
-                .issue(req(), &Capability::root()),
-        )
-        .unwrap_err();
+        // Deterministic readiness avoids a race between two overdue native timers
+        // when a busy executor is not scheduled until both delays have elapsed.
+        let err = block_on(over(false).issue(req(), &Capability::root())).unwrap_err();
         assert!(format!("{err}").contains("timeout"), "{err}");
         assert!(err.is_transient(), "a timeout is transient");
-
-        // Work well within the budget → it completes normally.
-        let out = block_on(
-            over(Duration::from_millis(5), Duration::from_millis(200))
-                .issue(req(), &Capability::root()),
-        );
-        assert!(out.is_ok(), "fast work completes: {out:?}");
+        assert!(block_on(over(true).issue(req(), &Capability::root())).is_ok());
     }
 
     #[test]
@@ -2420,6 +2532,35 @@ mod tests {
             other.is_ok(),
             "an unlimited prefix needs no clock: {other:?}"
         );
+    }
+
+    #[test]
+    fn a_retry_without_timing_facilities_refuses_before_invoking() {
+        for missing_clock in [false, true] {
+            let seen = Arc::new(AtomicU32::new(0));
+            let inner = EndpointSpace::new().bind_arc(
+                Exact::new("urn:flaky"),
+                Arc::new(Flaky {
+                    fail: 1,
+                    seen: seen.clone(),
+                }),
+            );
+            let mut retry = Retry::new(inner, 3);
+            if missing_clock {
+                retry.clock = None;
+            } else {
+                retry.timer = None;
+            }
+            let kernel = Kernel::new(Arc::new(retry));
+            let err = block_on(kernel.issue(
+                Request::new(Verb::Source, Iri::parse("urn:flaky").unwrap()),
+                &Capability::root(),
+            ))
+            .unwrap_err();
+            assert!(err.to_string().contains("Retry::with_clock"));
+            assert!(err.to_string().contains("Retry::with_timer"));
+            assert_eq!(seen.load(Ordering::SeqCst), 0);
+        }
     }
 
     /// The breaker without a clock refuses before touching the dependency.

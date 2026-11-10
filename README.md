@@ -18,7 +18,7 @@ composable everywhere.
 | overlay | what it does |
 | --- | --- |
 | **`RateLimit`** | Refuse resolutions over a per-URI-prefix rate with `RetryAfter`, the time until the window opens (external politeness — a published rate you must not exceed). |
-| **`Retry`** | Re-issue on a *transient* failure, or after a *retry-after* delay that fits the run, up to N times and within the run's retry budget — but only for an *idempotent* verb (a `Sink` is never blindly re-sent). |
+| **`Retry`** | Re-issue with capped exponential full jitter and an overall time limit, honoring a *retry-after* minimum, up to N attempts and within the run's retry budget — but only for an *idempotent* verb (a `Sink` is never blindly re-sent). |
 | **`CircuitBreaker`** | Count consecutive transient failures per target; **trip open** after a threshold and **fail fast** with `RetryAfter` for the cooldown left (without touching the dependency), then **half-open** and probe to recover. |
 | **`Failover`** | Try an ordered list `[primary, backup, …]`, advancing on a transient or retry-after failure of an idempotent verb. |
 | **`Timeout`** | Bound an invocation; if the budget elapses, drop the work and return a transient timeout. |
@@ -43,8 +43,7 @@ of this crate's):
   deadline: `Invocation::time_left`), lowered by `Retry::with_max_wait` when that is
   set; with no deadline, `with_max_wait` alone is the bound, and unset it waits for
   nothing. The wait is on a `Timer` (`Retry::with_timer`; futures-timer by default
-  on a native target, none on wasm32, where every `RetryAfter` is returned to the
-  caller). An over-budget failure is never repeated by anything (under the same
+  on a native target, none on wasm32, where the host must install one). An over-budget failure is never repeated by anything (under the same
   bound it costs the same and fails the same);
 - **the run's retry budget** — when the host configured one
   (`Kernel::with_retry_budget`, ceilings granted as `urn:cap:retry:<n>`), every
@@ -52,6 +51,36 @@ of this crate's):
   resolution tree, so nested `Retry` layers cannot multiply their attempts; with the
   pool spent, an overlay returns the error it received. `attempts` still caps each
   `Retry` layer. A kernel with no retry budget keeps each overlay's own `attempts`.
+
+`Retry::new(space, attempts)` defaults to a 100 ms initial backoff, a 10 second
+maximum backoff, and a 30 second overall time limit. Configure these with
+`with_backoff(initial, maximum)` and `with_time_limit(limit)`. The first retry's
+cap is `min(initial, maximum)`; each later cap doubles, saturating at the maximum.
+Full jitter samples uniformly from zero through the current cap at millisecond
+resolution, spreading clients across the window instead of keeping them in step.
+A known `RetryAfter` delay is a minimum: the actual wait is the larger of that
+delay and the sampled backoff, even when the server's delay exceeds the backoff
+cap. `with_max_wait` still controls which server delays this overlay accepts.
+
+The overall limit includes endpoint calls and all waits, and is lowered by the
+run's remaining time. It races each async call against a timer and checks elapsed
+time before starting another attempt. No attempt starts at the deadline. On the
+body face it ends when the endpoint hands over the body; use `Timeout` below it
+to bound subsequent streaming. A zero initial backoff disables backoff; an
+overall limit still applies. Use `with_clock` to install the kernel's clock and
+`with_timer` to install a timer advancing that same clock in tests. `with_jitter`
+accepts a custom sampler; `FullJitter::seeded` gives a repeatable sequence for
+simulations. Jitter is for scheduling, not security.
+
+**Core API blockers:** core 0.3.3 has no declared resend safety on `ActionSpec`,
+so every `Sink` remains excluded, including one carrying an arbitrary key.
+A keyed Sink can only be enabled once core defines the contract declaration and
+its named key argument. Core's `Error::Unavailable(String)` also cannot carry
+structured attempts and elapsed time. Attempt/pool exhaustion therefore still
+returns the last error; overall elapse returns `Error::Timeout`. Structured final
+failure fields remain blocked on a core error API addition; no prose encoding is
+presented as a typed value. This implements the independent timing work from
+ledger #3385, not those blocked portions.
 
 `Retry` and `Failover` re-issue only when every attached input body can reopen.
 A live `Body::Once` attachment skips the retry or failover advance: the overlay
@@ -286,8 +315,9 @@ hand what the walk cannot see: the catalog and every description through an
 overlay are the wrapped space's verbatim; a threaded read is cached under the
 wrapped endpoint's thread and cut by a `Sink` through the overlay, a live read stays
 live, a pure read caches with no thread; every typed `Error` an endpoint raises
-comes out of every overlay unchanged (`Retry` re-issues a transient one `attempts`
-times and returns the last); each overlay's own refusal is typed as its semantics
+comes out of every overlay unchanged when its policy limits permit it (`Retry`
+re-issues a transient one up to `attempts` times and returns the last, or a timeout
+when its overall time limit elapses); each overlay's own refusal is typed as its semantics
 say (open circuit: `RetryAfter` for the cooldown left; elapsed budget: transient
 `Timeout`; rate limit: `RetryAfter` until the window opens) and none of them is ever
 cached. `tests/failure_classes.rs` holds every failure class against `Retry`,
@@ -297,10 +327,39 @@ failure (never re-issued, ledger #972). `REQUIRED` runs on the `Sink` too, and a
 ignore a required input or refuse its absence untyped) is found through every
 overlay exactly as it is bare.
 
+## Sharing a circuit breaker across mounts
+
+Combine the governed spaces once, then share one `Arc<CircuitBreaker<_>>` across
+all mounts. Circuits are keyed by request target, so a failure at one target does
+not open another target's circuit. Multiple hosts can share the same `Arc` too.
+Creating a separate breaker for each mount creates independent circuit state.
+
+```rust
+use std::{sync::Arc, time::Duration};
+use ikigai_core::{EndpointSpace, Fallback, Kernel, Mount, Space};
+use ikigai_throttle::CircuitBreaker;
+
+let primary: Arc<dyn Space> = Arc::new(EndpointSpace::new()); // host bindings
+let secondary: Arc<dyn Space> = Arc::new(EndpointSpace::new());
+let governed = Fallback::new(vec![primary, secondary]);
+let shared = Arc::new(CircuitBreaker::new(governed, 3, Duration::from_secs(30)));
+let root = Fallback::new(vec![
+    Arc::new(Mount::new("urn:primary:", shared.clone())),
+    Arc::new(Mount::new("urn:secondary:", shared.clone())),
+]);
+let kernel = Kernel::new(Arc::new(root));
+```
+
+The prefixes filter requests; mounts do not rewrite targets. A host with an
+injected clock calls `with_clock` on the breaker before sharing it. The mock-clock
+test in `tests/retry_policy.rs` opens a circuit through one host, observes it open
+through another, checks another mount's target is unaffected, and recovers after
+the cooldown.
+
 ## Notes
 
 - **Time comes from a core `Clock`.** `RateLimit` (its window) and
-  `CircuitBreaker` (its cooldown) read the clock given with `with_clock`, and
+  `CircuitBreaker` (its cooldown), and `Retry` (its overall limit) read the clock given with `with_clock`, and
   default to a monotonic clock on a native target. Hand them the clock you gave
   your kernel, or a test clock that moves only when the test moves it. Time is
   read in whole milliseconds. Never a temporal corridor's pinned clock: a window
@@ -309,11 +368,10 @@ overlay exactly as it is bare.
   wasm32). A browser has a clock and timers, but this library cannot reach them
   without JavaScript imports, and the same target also runs where there is no
   JavaScript (wasmtime). So the HOST supplies them, as it does for its kernel: a
-  clock for `RateLimit` and `CircuitBreaker` (`with_clock`), and a `Timer` for
+  clock for `RateLimit`, `CircuitBreaker`, and `Retry` (`with_clock`), and a `Timer` for
   `Timeout` and `Retry` (`with_timer`; a timer wakes a future, which a clock
-  cannot). Without one, `RateLimit`, `CircuitBreaker` and `Timeout` refuse what
-  they govern with an error naming the builder, and never panic; a `Retry` without
-  a timer returns every `RetryAfter` unchanged. A browser host's timer resolves a
+  cannot). Without the required facilities, all four refuse what
+  they govern with an error naming the builder, and never panic. A browser host's timer resolves a
   `setTimeout` promise in a `spawn_local` task and hands the wake-up back over a
   channel, which keeps the future `Send`.
 - `Timeout` bounds *genuinely-async* work. A purely **synchronous blocking** call

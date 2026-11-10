@@ -1,5 +1,5 @@
-//! [`Timer`]: what a [`Retry`](crate::Retry) waits a [`RetryAfter`](ikigai_core::Error::RetryAfter)
-//! delay out on, and what a [`Timeout`](crate::Timeout) races its budget against.
+//! [`Timer`]: what a [`Retry`](crate::Retry) waits backoff and retry-after delays on,
+//! and what [`Retry`](crate::Retry) and [`Timeout`](crate::Timeout) race their budgets against.
 //!
 //! A wait is not a [`Clock`](ikigai_core::Clock): a clock answers "what time is it" and
 //! never "wake me when", so an overlay that waits needs something that can suspend a
@@ -7,8 +7,7 @@
 //! native target defaults to futures-timer, whose backend runs a helper thread;
 //! wasm32-unknown-unknown has no default. A browser has timers, but only behind
 //! JavaScript imports, so a browser host supplies one (ledger #2189). A `Retry` without a
-//! timer returns every `RetryAfter` unchanged, so the caller owns the wait; a `Timeout`
-//! without one refuses what it governs.
+//! timer refuses before starting work, as does a `Timeout` without one.
 //!
 //! A browser timer's future is not `Send` and this trait's is, so a browser host resolves
 //! a `setTimeout` promise in a `spawn_local` task and awaits a `oneshot` channel that the
