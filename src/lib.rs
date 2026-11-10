@@ -11,8 +11,8 @@
 //! - [`RateLimit`] — reject resolutions over a per-URI-prefix rate (external
 //!   politeness: a published rate you must not exceed).
 //! - [`Retry`] — re-issue on a *transient* failure, or after a *retry-after* delay
-//!   that fits the run, up to N times, for an *idempotent* verb only (a `Sink` is
-//!   never blindly re-sent).
+//!   that fits the run, up to N times, for an *idempotent* verb, or a `Sink` whose
+//!   contract declares a resend safe (a `Sink` is never blindly re-sent).
 //! - [`CircuitBreaker`] — trip open after consecutive transient failures and fail
 //!   fast (retry-after the cooldown left) for a cooldown, then half-open and probe to
 //!   recover.
@@ -87,7 +87,7 @@
 //!
 //! | class received | [`Retry`] | [`Failover`] | [`CircuitBreaker`] |
 //! | --- | --- | --- | --- |
-//! | transient | re-issue, idempotent verbs only | advance to the next target | counts toward tripping |
+//! | transient | re-issue, idempotent verbs and declared-safe Sinks only | advance to the next target | counts toward tripping |
 //! | retry-after | wait the delay and re-issue, only when it fits | advance (another target is not limited) | not counted |
 //! | over-budget, denied, refused, permanent, unknown | returned unchanged | returned unchanged | not counted |
 //!
@@ -156,8 +156,9 @@ mod timeout;
 pub use timeout::Timeout;
 
 use ikigai_core::{
-    Bindings, Body, Clock, Description, Endpoint, Error, FailureClass, Forward, Invocation, Iri,
-    Representation, Request, Resolution, Resolved, Scope, Space, SpaceEntry, Time, Topology, Verb,
+    ActionSpec, ArgRef, Bindings, Body, Clock, Description, Endpoint, Error, FailureClass, Forward,
+    InputSource, Invocation, Iri, Representation, Request, Resolution, Resolved, Scope, Space,
+    SpaceEntry, Time, Topology, Verb,
 };
 use std::sync::Arc;
 
@@ -565,8 +566,9 @@ impl Endpoint for RateLimited {
 
 /// A [`Space`] overlay that **re-issues** a failed invocation when the failure's
 /// [class](Error::class) says a repeat may succeed, for an
-/// [idempotent](Verb::is_idempotent) verb only: a `Sink` is never blindly re-sent (a
-/// re-send could double-write; that needs an idempotency key). Nygard's stability
+/// [idempotent](Verb::is_idempotent) verb, or a `Sink` whose contract says a resend is
+/// safe: a `Sink` is never blindly re-sent, since a re-send could double-write (see
+/// **Resend safety** below). Nygard's stability
 /// family; sibling of [`RateLimit`], [`CircuitBreaker`] and [`Failover`].
 ///
 /// What it does with each [`FailureClass`] it RECEIVES:
@@ -597,10 +599,17 @@ impl Endpoint for RateLimited {
 /// to spread callers across the window instead of synchronizing their retries.
 /// A RetryAfter delay is a minimum and is never shortened by jitter or the cap.
 ///
+/// **Resend safety** (ledger #3381) comes from the wrapped endpoint's contract: the
+/// Sink action's [`ActionSpec::resend`]. A Sink declared
+/// [`resend_safe`](ActionSpec::resend_safe) is re-sent like an idempotent verb; one
+/// declared [`resend_safe_with_key`](ActionSpec::resend_safe_with_key) is re-sent only
+/// when the call gives that declared input a non-blank value, inline or, for a binding
+/// input, captured from the target. A Sink that declares nothing, or arrives without
+/// its key, is returned on the first failure, whatever argument a caller adds.
+///
 /// Core 0.3 cannot carry structured retry-exhaustion fields: attempt exhaustion
 /// still returns the last error; an overall elapse returns [`Error::Timeout`].
-/// Structured attempts/elapsed errors and contract-declared Sink resend safety
-/// require a core API addition. Until then every Sink remains excluded.
+/// Structured attempts/elapsed errors require a core API addition (ledger #3386).
 ///
 /// ```
 /// use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
@@ -752,12 +761,10 @@ enum Repeat {
     Never,
 }
 
-/// What a re-issuing overlay may do with `error` on `verb`: decided from core's
-/// [`Error::class`] and [`Verb::is_idempotent`], never from a table of this crate's.
-fn repeat(error: &Error, verb: Verb) -> Repeat {
-    if !verb.is_idempotent() {
-        return Repeat::Never;
-    }
+/// What a re-issuing overlay may do with `error`: decided from core's
+/// [`Error::class`], never from a table of this crate's. Whether the call may be
+/// SENT again at all is [`resend_safe`]'s question.
+fn repeat(error: &Error) -> Repeat {
     match (error.class(), error) {
         (FailureClass::Transient, _) => Repeat::Now,
         (
@@ -768,6 +775,48 @@ fn repeat(error: &Error, verb: Verb) -> Repeat {
         ) => Repeat::After(*delay),
         _ => Repeat::Never,
     }
+}
+
+/// Whether sending this call again cannot act twice: always for an
+/// [idempotent](Verb::is_idempotent) verb; for a `Sink`, only when the action's contract
+/// declares a [`Resend`](ikigai_core::Resend) (ledger #3381) and, under a key, the call
+/// gives that key a non-blank value. A Sink that declares nothing, names a key it does
+/// not declare as an input, or arrives without its key may already have run, so it is
+/// never sent again.
+fn resend_safe(endpoint: &dyn Endpoint, inv: &Invocation<'_>) -> bool {
+    let verb = inv.request.verb;
+    if verb.is_idempotent() {
+        return true;
+    }
+    let description = endpoint.describe();
+    let safe = description
+        .actions
+        .iter()
+        .find(|action| action.verb == verb)
+        .is_some_and(|action| action.resend_is_safe(|name| key_given(action, name, inv)));
+    if !safe {
+        inv.trace_note(
+            "retry_skipped",
+            "a Sink is sent again only when its contract declares resend safety and the call carries its key",
+        );
+    }
+    safe
+}
+
+/// Whether the call gives the declared input `name` a non-blank value, read from where
+/// the contract says it comes: the grammar's capture for a binding, an inline argument
+/// otherwise. A value held only by reference or content id is not read here, so it does
+/// not count: a resend is allowed only on what can be seen to be the same key.
+fn key_given(action: &ActionSpec, name: &str, inv: &Invocation<'_>) -> bool {
+    let value = match action.inputs.iter().find(|input| input.name == name) {
+        Some(input) if input.source == InputSource::Binding => inv.bindings.get(name),
+        Some(_) => match inv.request.args.get(name) {
+            Some(ArgRef::Inline(bytes)) => std::str::from_utf8(bytes).ok(),
+            _ => None,
+        },
+        None => None,
+    };
+    value.is_some_and(|value| !value.trim().is_empty())
 }
 
 /// A re-issue must be able to reopen every attached input, even if the failed
@@ -790,7 +839,8 @@ fn spend(inv: &Invocation<'_>) -> bool {
 }
 
 /// The endpoint a [`Retry`] resolves to: re-invoke the inner endpoint while the
-/// failure's class allows it, the verb is idempotent and the budget has a retry.
+/// failure's class allows it, a resend is safe ([`resend_safe`]) and the budget has a
+/// retry.
 struct RetryEndpoint {
     inner: Arc<dyn Endpoint>,
     attempts: u32,
@@ -881,11 +931,14 @@ impl RetryEndpoint {
             if attempt >= self.attempts {
                 return Err(error);
             }
-            let minimum = match repeat(&error, inv.request.verb) {
+            let minimum = match repeat(&error) {
                 Repeat::Now => Duration::ZERO,
                 Repeat::After(delay) if self.fits(delay, inv) => delay,
                 Repeat::After(_) | Repeat::Never => return Err(error),
             };
+            if !resend_safe(&*self.inner, inv) {
+                return Err(error);
+            }
             if !attachments_allow_reissue(inv) {
                 return Err(error);
             }

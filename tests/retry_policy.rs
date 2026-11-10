@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use futures::executor::block_on;
 use ikigai_core::{
-    Capability, Clock, Endpoint, EndpointSpace, Error, Exact, Invocation, Iri, Kernel, ReprType,
-    Representation, Request, Time, Verb,
+    ActionSpec, ArgRef, ArgSpec, Capability, Clock, Description, Endpoint, EndpointSpace, Error,
+    Exact, Invocation, Iri, Kernel, ReprType, Representation, Request, Time, UriTemplate, Verb,
 };
 use ikigai_throttle::{CircuitBreaker, FullJitter, Jitter, Retry, Timer};
 
@@ -51,6 +51,7 @@ struct Flaky {
     work: Duration,
     pending: bool,
     error: Error,
+    contract: Option<Description>,
 }
 #[async_trait::async_trait]
 impl Endpoint for Flaky {
@@ -68,6 +69,11 @@ impl Endpoint for Flaky {
                 b"ok".to_vec(),
             ))
         }
+    }
+    fn describe(&self) -> Description {
+        self.contract
+            .clone()
+            .unwrap_or_else(|| Description::new("flaky"))
     }
 }
 struct Fixture {
@@ -97,8 +103,33 @@ impl Fixture {
                 work,
                 pending,
                 error,
+                contract: None,
             },
         )
+    }
+    /// A Sink at `target` (an `Exact` IRI or a template) that fails `failures` times,
+    /// under `contract`'s declared resend safety.
+    fn sink(
+        &self,
+        target: impl ikigai_core::Grammar + 'static,
+        failures: u32,
+        contract: ActionSpec,
+    ) -> Retry<EndpointSpace> {
+        let space = EndpointSpace::new().bind(
+            target,
+            Flaky {
+                calls: self.calls.clone(),
+                failures,
+                clock: self.clock.clone(),
+                work: Duration::ZERO,
+                pending: false,
+                error: down(),
+                contract: Some(Description::new("flaky").action(contract)),
+            },
+        );
+        Retry::new(space, 5)
+            .with_clock(self.clock.clone())
+            .with_timer(self.timer.clone())
     }
     fn retry(&self, failures: u32, attempts: u32) -> Retry<EndpointSpace> {
         Retry::new(
@@ -324,4 +355,98 @@ fn an_initial_delay_above_the_maximum_is_clamped() {
     );
     assert!(read(&kernel, false).is_ok());
     assert_eq!(f.waits(), [ms(5)]);
+}
+
+fn keyed_sink() -> ActionSpec {
+    ActionSpec::new(Verb::Sink)
+        .input(ArgSpec::new("key").optional())
+        .resend_safe_with_key("key")
+}
+
+fn sink(kernel: &Kernel, key: Option<&[u8]>) -> Result<(), Error> {
+    let mut req = request(Verb::Sink);
+    if let Some(key) = key {
+        req = req.with_arg("key", ArgRef::Inline(key.to_vec()));
+    }
+    block_on(kernel.issue(req, &Capability::root())).map(|_| ())
+}
+
+#[test]
+fn a_sink_declared_safe_under_a_key_is_repeated_when_the_call_carries_it() {
+    let f = Fixture::new();
+    let kernel = f.kernel(f.sink(Exact::new("urn:dep"), 2, keyed_sink()));
+    assert!(sink(&kernel, Some(b"order-7")).is_ok());
+    assert_eq!(
+        f.calls(),
+        3,
+        "two transient failures, then the keyed resend lands"
+    );
+    assert_eq!(f.waits().len(), 2, "each resend waits its backoff");
+}
+
+#[test]
+fn a_keyed_sink_without_its_key_is_never_repeated() {
+    for key in [None, Some(&b""[..]), Some(&b"  "[..])] {
+        let f = Fixture::new();
+        let kernel = f.kernel(f.sink(Exact::new("urn:dep"), 2, keyed_sink()));
+        assert_eq!(sink(&kernel, key).unwrap_err(), down(), "key {key:?}");
+        assert_eq!(f.calls(), 1, "key {key:?}");
+        assert!(f.waits().is_empty());
+    }
+}
+
+#[test]
+fn a_sink_declared_safe_outright_is_repeated() {
+    let f = Fixture::new();
+    let kernel = f.kernel(f.sink(
+        Exact::new("urn:dep"),
+        2,
+        ActionSpec::new(Verb::Sink).resend_safe(),
+    ));
+    assert!(sink(&kernel, None).is_ok());
+    assert_eq!(f.calls(), 3);
+}
+
+#[test]
+fn a_sink_that_declares_nothing_is_never_repeated() {
+    let f = Fixture::new();
+    let kernel = f.kernel(f.sink(Exact::new("urn:dep"), 2, ActionSpec::new(Verb::Sink)));
+    assert_eq!(sink(&kernel, Some(b"order-7")).unwrap_err(), down());
+    assert_eq!(f.calls(), 1);
+}
+
+#[test]
+fn a_permanent_failure_of_a_safe_sink_is_not_repeated() {
+    let f = Fixture::new();
+    let space = EndpointSpace::new().bind(
+        Exact::new("urn:dep"),
+        Flaky {
+            calls: f.calls.clone(),
+            failures: 2,
+            clock: f.clock.clone(),
+            work: Duration::ZERO,
+            pending: false,
+            error: Error::Endpoint("bad".into()),
+            contract: Some(
+                Description::new("flaky").action(ActionSpec::new(Verb::Sink).resend_safe()),
+            ),
+        },
+    );
+    let retry = Retry::new(space, 5)
+        .with_clock(f.clock.clone())
+        .with_timer(f.timer.clone());
+    assert!(sink(&f.kernel(retry), None).is_err());
+    assert_eq!(f.calls(), 1);
+}
+
+#[test]
+fn a_key_captured_from_the_target_counts_as_given() {
+    let contract = ActionSpec::new(Verb::Sink)
+        .input(ArgSpec::new("key").binding())
+        .resend_safe_with_key("key");
+    let f = Fixture::new();
+    let kernel = f.kernel(f.sink(UriTemplate::parse("urn:orders/{key}").unwrap(), 2, contract));
+    let req = Request::new(Verb::Sink, Iri::parse("urn:orders/order-7").unwrap());
+    assert!(block_on(kernel.issue(req, &Capability::root())).is_ok());
+    assert_eq!(f.calls(), 3);
 }
