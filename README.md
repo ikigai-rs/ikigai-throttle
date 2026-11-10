@@ -18,7 +18,7 @@ composable everywhere.
 | overlay | what it does |
 | --- | --- |
 | **`RateLimit`** | Refuse resolutions over a per-URI-prefix rate with `RetryAfter`, the time until the window opens (external politeness — a published rate you must not exceed). |
-| **`Retry`** | Re-issue with capped exponential full jitter and an overall time limit, honoring a *retry-after* minimum, up to N attempts and within the run's retry budget — but only for an *idempotent* verb (a `Sink` is never blindly re-sent). |
+| **`Retry`** | Re-issue with capped exponential full jitter and an overall time limit, honoring a *retry-after* minimum, up to N attempts and within the run's retry budget — but only for an *idempotent* verb, or a `Sink` whose contract declares a resend safe (a `Sink` is never blindly re-sent). |
 | **`CircuitBreaker`** | Count consecutive transient failures per target; **trip open** after a threshold and **fail fast** with `RetryAfter` for the cooldown left (without touching the dependency), then **half-open** and probe to recover. |
 | **`Failover`** | Try an ordered list `[primary, backup, …]`, advancing on a transient or retry-after failure of an idempotent verb. |
 | **`Timeout`** | Bound an invocation; if the budget elapses, drop the work and return a transient timeout. |
@@ -29,7 +29,10 @@ of this crate's):
 
 - **the verb** — `Verb::is_idempotent`: Source / Exists / Meta / Delete are
   idempotent, so `Retry` and `Failover` may re-issue them; a non-idempotent `Sink` is
-  never re-sent (that needs an idempotency key, not a blind retry);
+  never blindly re-sent. `Retry` re-sends a `Sink` only when its contract's
+  `ActionSpec::resend` says so: `resend_safe()`, or `resend_safe_with_key(key)` with
+  that declared input given a non-blank value (inline, or captured from the target
+  for a binding input). `Failover` never moves a `Sink` to another target;
 - **the failure's class** — `Error::class()`, which says who may repeat a failure
   and when:
 
@@ -72,15 +75,16 @@ overall limit still applies. Use `with_clock` to install the kernel's clock and
 accepts a custom sampler; `FullJitter::seeded` gives a repeatable sequence for
 simulations. Jitter is for scheduling, not security.
 
-**Core API blockers:** core 0.3.3 has no declared resend safety on `ActionSpec`,
-so every `Sink` remains excluded, including one carrying an arbitrary key.
-A keyed Sink can only be enabled once core defines the contract declaration and
-its named key argument. Core's `Error::Unavailable(String)` also cannot carry
+**Resend safety** comes from core 0.3.4's `ActionSpec::resend` (ledger #3381): a
+`Sink` that declares nothing, names a key it does not declare as an input, or
+arrives without its key's value is returned on its first failure, even when a
+caller adds an arbitrary key argument.
+
+**Core API blocker:** core's `Error::Unavailable(String)` cannot carry
 structured attempts and elapsed time. Attempt/pool exhaustion therefore still
 returns the last error; overall elapse returns `Error::Timeout`. Structured final
 failure fields remain blocked on a core error API addition; no prose encoding is
-presented as a typed value. This implements the independent timing work from
-ledger #3385, not those blocked portions.
+presented as a typed value. The typed final failure is ledger #3386.
 
 `Retry` and `Failover` re-issue only when every attached input body can reopen.
 A live `Body::Once` attachment skips the retry or failover advance: the overlay

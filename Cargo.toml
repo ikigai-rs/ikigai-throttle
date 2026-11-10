@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-throttle"
-description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue idempotent failures by their failure class, from the run's shared budget), CircuitBreaker (trip open on a failing dependency), Failover (try [primary, backup, ...] on a transient or retry-after failure), Timeout (bound an invocation, transient on elapse), Throttle (cap concurrency, park the excess); logging & load-balancing later."
+description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue idempotent or declared-resend-safe failures by their failure class, from the run's shared budget), CircuitBreaker (trip open on a failing dependency), Failover (try [primary, backup, ...] on a transient or retry-after failure), Timeout (bound an invocation, transient on elapse), Throttle (cap concurrency, park the excess); logging & load-balancing later."
 # 0.4.0: the public API now uses core 0.3 types (scoped content store, ledger #2965).
 version = "0.4.0"
 edition = "2021"
@@ -32,7 +32,9 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 # 0.2.8 adds `Invocation::attachments_reopenable`, checked before Retry/Failover re-issue.
 # 0.3.0 scopes held content to its deliverer; principal-less holds belong to root,
 # and ContentStore::put/put_replay are root-only (ledger #2965).
-ikigai-core = "0.3.0"
+# 0.3.4 adds `ActionSpec::resend` (ledger #3381): Retry re-sends a Sink only when its
+# contract declares the resend safe, under its key when it names one.
+ikigai-core = "0.3.4"
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
 # Throttle parks the excess on a fair async Semaphore (runtime-agnostic).
