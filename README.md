@@ -213,6 +213,14 @@ let resilient = Failover::new(vec![Arc::new(primary), Arc::new(backup_space)]);
 it's dead and fails fast; that trip-open is the instant trigger for `Failover` to
 move to the backup.
 
+After a breaker's cooldown, exactly one half-open probe runs at a time. A one-shot
+body holds the probe until its stream ends or is dropped. While a probe runs,
+other calls receive `RetryAfter` with no delay (its completion time is unknown).
+Success closes the circuit; a transient failure restarts the cooldown. Cancellation,
+a dropped unread body, or a nontransient error releases the probe so the next call
+can probe, without deciding the dependency's health. Results from calls admitted
+before a trip or recovery cannot change that newer state.
+
 ## Observable state
 
 What the governors hold is readable as resources, in a space of its own that the

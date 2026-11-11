@@ -1046,6 +1046,10 @@ struct Breaker {
     failures: u32,
     /// When the circuit tripped open, if it is open.
     opened_at: Option<Time>,
+    /// Invalidates outcomes admitted before the latest trip or recovery.
+    generation: u64,
+    /// Only one half-open call (including its one-shot body) owns the probe.
+    probing: bool,
 }
 
 /// A [`Space`] overlay implementing Nygard's **Circuit Breaker** (from *Release
@@ -1053,9 +1057,15 @@ struct Breaker {
 /// [`Transient`](ikigai_core::FailureClass::Transient)); after `threshold` it **trips
 /// open** and, for `cooldown`, fails fast *without touching the dependency*, so a dead
 /// resource stops being hammered. Once `cooldown` elapses it goes **half-open**: the
-/// next call probes the dependency — success **closes** the circuit, another failure
-/// **re-opens** it. Every other class passes through uncounted: a `RetryAfter` says the
-/// dependency is limited, not broken, and over-budget, denied, refused, permanent and
+/// next call probes the dependency — success **closes** the circuit, another transient
+/// failure **re-opens** it. Exactly one probe is admitted at a time, through the end of
+/// its one-shot body. Concurrent calls receive `RetryAfter` with no delay while that
+/// probe runs. Cancellation, dropping an unread body, or a nontransient error releases
+/// the probe without deciding health, so the next call may probe. Outcomes admitted
+/// before a trip or recovery cannot change the new circuit state.
+///
+/// Every other class passes through uncounted: a `RetryAfter` says the dependency is
+/// limited, not broken, and over-budget, denied, refused, permanent and
 /// unknown failures say nothing about its health. Sibling of [`RateLimit`] and
 /// [`Retry`]; its trip-open is the fast trigger a Failover reads.
 ///
@@ -1214,13 +1224,19 @@ impl Tally {
     /// Update the circuit for an outcome: `None` is a success, which closes it (and
     /// confirms a probe); a transient failure counts toward tripping it (or re-opens a
     /// failed probe); no other class says the dependency is broken.
-    fn record(&self, clock: &dyn Clock, failure: Option<&Error>) {
+    fn record(&self, call: &BreakerCall, failure: Option<&Error>) {
         let mut states = self.states.lock().expect("breaker lock");
+        if states.get(&self.target).map_or(0, |b| b.generation) != call.generation {
+            return; // An outcome from before the latest trip/recovery cannot change it.
+        }
         let changed = match failure {
             None => match states.get_mut(&self.target) {
                 Some(breaker) if breaker.failures != 0 || breaker.opened_at.is_some() => {
                     breaker.failures = 0;
-                    breaker.opened_at = None;
+                    if breaker.opened_at.take().is_some() {
+                        breaker.generation = breaker.generation.wrapping_add(1);
+                    }
+                    breaker.probing = false;
                     true
                 }
                 _ => false, // already closed: nothing changed
@@ -1229,7 +1245,9 @@ impl Tally {
                 let breaker = states.entry(self.target.clone()).or_default();
                 breaker.failures = breaker.failures.saturating_add(1);
                 if breaker.failures >= self.threshold {
-                    breaker.opened_at = Some(clock.now()); // trip, or re-open a failed probe
+                    breaker.opened_at = Some(call.clock.now()); // trip, or re-open a failed probe
+                    breaker.generation = breaker.generation.wrapping_add(1);
+                    breaker.probing = false;
                 }
                 true
             }
@@ -1243,9 +1261,8 @@ impl Tally {
 }
 
 impl BreakerEndpoint {
-    /// The clock, when the circuit lets this call through (closed, or a half-open probe);
-    /// otherwise the refusal.
-    fn gate(&self) -> Result<&Arc<dyn Clock>, Error> {
+    /// Admit a closed call or reserve the single half-open probe; otherwise refuse.
+    fn gate(&self) -> Result<BreakerCall, Error> {
         // No clock, no cooldown to measure: refuse rather than guess (`with_clock`).
         let Some(clock) = &self.clock else {
             return Err(Error::Endpoint(format!(
@@ -1258,18 +1275,58 @@ impl BreakerEndpoint {
         // A target with no entry is closed; reading it never creates one, so the state
         // face lists only targets that have failed (a closed circuit with no history is
         // what an absent key means).
-        let states = self.tally.states.lock().expect("breaker lock");
-        if let Some(opened) = states.get(&self.tally.target).and_then(|b| b.opened_at) {
-            let cooled = elapsed(clock.now(), opened);
-            if cooled < millis(self.cooldown) {
-                return Err(Error::RetryAfter {
-                    delay: Some(self.cooldown.saturating_sub(Duration::from_millis(cooled))),
-                    detail: format!("circuit open for `{}`", self.tally.target),
-                });
+        let mut states = self.tally.states.lock().expect("breaker lock");
+        let mut probe = false;
+        if let Some(breaker) = states.get_mut(&self.tally.target) {
+            if let Some(opened) = breaker.opened_at {
+                let cooled = elapsed(clock.now(), opened);
+                if breaker.probing || cooled < millis(self.cooldown) {
+                    return Err(Error::RetryAfter {
+                        // An in-flight probe has no known completion time.
+                        delay: (!breaker.probing)
+                            .then(|| self.cooldown.saturating_sub(Duration::from_millis(cooled))),
+                        detail: format!("circuit open for `{}`", self.tally.target),
+                    });
+                }
+                // Reserve under the same lock as the gate check.
+                breaker.probing = true;
+                probe = true;
             }
-            // Cooldown elapsed → let this call through as a half-open probe.
         }
-        Ok(clock)
+        Ok(BreakerCall {
+            tally: Arc::clone(&self.tally),
+            clock: Arc::clone(clock),
+            generation: states.get(&self.tally.target).map_or(0, |b| b.generation),
+            probe,
+        })
+    }
+}
+
+/// Owns probe admission through the call and, on the body face, through its end.
+/// Cancellation or an unread body releases admission without inventing an outcome.
+struct BreakerCall {
+    tally: Arc<Tally>,
+    clock: Arc<dyn Clock>,
+    generation: u64,
+    probe: bool,
+}
+
+impl BreakerCall {
+    fn record(self, failure: Option<&Error>) {
+        self.tally.record(&self, failure);
+    }
+}
+
+impl Drop for BreakerCall {
+    fn drop(&mut self) {
+        if self.probe {
+            let mut states = self.tally.states.lock().expect("breaker lock");
+            if let Some(breaker) = states.get_mut(&self.tally.target) {
+                if breaker.generation == self.generation {
+                    breaker.probing = false;
+                }
+            }
+        }
     }
 }
 
@@ -1282,9 +1339,9 @@ impl Encloses for BreakerEndpoint {
 #[async_trait::async_trait]
 impl Endpoint for BreakerEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation, Error> {
-        let clock = self.gate()?;
+        let call = self.gate()?;
         let outcome = self.inner.invoke(inv).await;
-        self.tally.record(&**clock, outcome.as_ref().err());
+        call.record(outcome.as_ref().err());
         outcome
     }
 
@@ -1292,16 +1349,11 @@ impl Endpoint for BreakerEndpoint {
     /// part-way, by its error's class, as a call failing so would be. A body dropped
     /// unread counts neither way.
     async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>, Error> {
-        let clock = self.gate()?;
+        let call = self.gate()?;
         match self.inner.invoke_body(inv).await {
-            Ok(representation) => {
-                let (tally, clock) = (Arc::clone(&self.tally), Arc::clone(clock));
-                Ok(on_end(representation, move |failure| {
-                    tally.record(&*clock, failure)
-                }))
-            }
+            Ok(representation) => Ok(on_end(representation, move |failure| call.record(failure))),
             Err(error) => {
-                self.tally.record(&**clock, Some(&error));
+                call.record(Some(&error));
                 Err(error)
             }
         }

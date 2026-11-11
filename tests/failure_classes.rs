@@ -23,7 +23,9 @@ use ikigai_throttle::{CircuitBreaker, Failover, Rate, RateLimit, Retry, Timer};
 // These tests isolate failure-class and shared-pool decisions. Timing policy is
 // covered separately with deterministic jitter in retry_policy.rs.
 fn retry<S: Space>(inner: S, attempts: u32) -> Retry<S> {
-    Retry::new(inner, attempts).with_backoff(Duration::ZERO, Duration::ZERO)
+    Retry::new(inner, attempts)
+        .with_backoff(Duration::ZERO, Duration::ZERO)
+        .with_clock(Arc::new(Manual::default()))
 }
 
 /// A clock that moves only when the test (or the timer) moves it.

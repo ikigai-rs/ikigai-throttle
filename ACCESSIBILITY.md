@@ -109,3 +109,8 @@ time and full display, target naming, and the missing facility builders. No brow
 | 2026-10-31 | First version. |
 | 2026-11-10 | Document retry overall-limit and missing-facility refusals. |
 | 2026-11-11 | Retry's final failure is core's typed `GaveUp`. |
+
+Circuit-breaker concurrency tests in `tests/breaker_concurrency.rs` check the typed
+`RetryAfter` refusal while a half-open probe runs. Its delay is unknown (`None`);
+the existing message still names the governed target. No browser or assistive
+technology was used for these changes.
