@@ -75,8 +75,8 @@
 //!   ([`typed_errors_pass_through_unchanged`]): every `Error` variant an endpoint
 //!   can raise comes out of every overlay as the same variant with the same
 //!   message. The only overlay that re-issues is `Retry`, and it re-issues a
-//!   transient error exactly `attempts` times and then returns the LAST one
-//!   unchanged; a permanent error is returned on the first.
+//!   transient error exactly `attempts` times and then gives up typed (`GaveUp`)
+//!   with the count; a permanent error is returned unchanged on the first.
 //! - **Each overlay's own refusal is typed, and never cached**
 //!   ([`refusals_are_typed_and_never_cached`]): an open circuit is a
 //!   `RetryAfter` whose delay is the cooldown left; an elapsed budget is a transient
@@ -721,8 +721,9 @@ fn every_error() -> Vec<Error> {
 
 /// Every variant comes out of every overlay as it went in — same variant, same
 /// message. `Retry` (alone, and inside the stack) re-issues a transient failure
-/// `attempts` times and returns the last unchanged; every other class is returned on
-/// the first attempt (a `RetryAfter` too, here: no `Retry` in this list may wait).
+/// `attempts` times and then gives up typed (`GaveUp`, carrying the count and the last
+/// error's message, ledger #3385); every other class is returned unchanged on the first
+/// attempt (a `RetryAfter` too, here: no `Retry` in this list may wait).
 #[test]
 fn typed_errors_pass_through_unchanged() {
     for (label, compose, retries) in overlays() {
@@ -737,12 +738,21 @@ fn typed_errors_pass_through_unchanged() {
             ));
             let kernel = Kernel::new(compose(inner));
             let out = source(&kernel, "urn:failing", &[]).unwrap_err();
-            assert_eq!(out, error, "{label}: the error is the wrapped endpoint's");
             let expected = if error.class() == FailureClass::Transient {
                 retries
             } else {
                 1
             };
+            if expected > 1 {
+                assert!(
+                    matches!(&out, Error::GaveUp { attempts, detail, .. }
+                        if *attempts == expected && *detail == error.to_string()),
+                    "{label}: retried and gave up on {error:?}: {out:?}"
+                );
+                assert_eq!(out.class(), FailureClass::Transient, "{label}");
+            } else {
+                assert_eq!(out, error, "{label}: the error is the wrapped endpoint's");
+            }
             assert_eq!(
                 seen.load(Ordering::SeqCst),
                 expected,

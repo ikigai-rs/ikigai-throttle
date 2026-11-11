@@ -93,7 +93,8 @@
 //!
 //! A re-issue or an advance spends one retry from the run's shared pool
 //! ([`Invocation::retry_budget`](ikigai_core::Invocation::retry_budget)) when the host
-//! configured one, and with none left the overlay returns the error it received: the
+//! configured one, and with none left the overlay stops (a Failover returns the error
+//! it received; a Retry that already re-issued gives up typed, [`Error::GaveUp`]): the
 //! budget belongs to whoever issued the request, not to the overlay. A kernel with no
 //! retry budget keeps each overlay's own `attempts`. Logging, egress-filtering, and load-balancing
 //! overlays are later additions of the same shape. The motivating use is a standing
@@ -589,8 +590,8 @@ impl Endpoint for RateLimited {
 /// **The budget is the run's, not the overlay's** (ledger #1546). When the host
 /// configured a retry budget, the run carries one shared pool
 /// ([`Invocation::retry_budget`]); this overlay spends one retry from it before every
-/// re-issue, and returns the error it received when none is left, so nested `Retry`
-/// layers spend one pool instead of multiplying their attempts. `attempts` then caps
+/// re-issue, and stops when none is left, so nested `Retry` layers spend one pool
+/// instead of multiplying their attempts. `attempts` then caps
 /// this layer under the pool. With no pool (a kernel that configured none), `attempts`
 /// caps the number of calls. All attempts and waits also share a 30-second overall
 /// limit by default ([`with_time_limit`](Self::with_time_limit)). Backoff starts at
@@ -607,9 +608,18 @@ impl Endpoint for RateLimited {
 /// input, captured from the target. A Sink that declares nothing, or arrives without
 /// its key, is returned on the first failure, whatever argument a caller adds.
 ///
-/// Core 0.3 cannot carry structured retry-exhaustion fields: attempt exhaustion
-/// still returns the last error; an overall elapse returns [`Error::Timeout`].
-/// Structured attempts/elapsed errors require a core API addition (ledger #3386).
+/// **The final failure is typed** (ledger #3385): when Retry gives up on a failure it
+/// would repeat, because its attempts, the run's pool or its overall limit ran out, it
+/// returns [`Error::GaveUp`] with `attempts` (calls made, the first included), `elapsed`
+/// (on the installed clock, from the first attempt, waits included) and `detail` (the
+/// last error as it displayed). `GaveUp` means "retried and stopped": a failure Retry
+/// does not repeat (a refusal, a denial, a Sink with no declared resend safety, a
+/// retry-after delay that does not fit) comes back unchanged, and so does a repeatable
+/// one stopped by its attempts or the pool before any re-issue (`attempts` of 1, or an
+/// empty pool). An overall limit that cuts in after at least one call is always
+/// `GaveUp`. `GaveUp` is transient, so an outer Retry may repeat an inner one's; it
+/// ADDS the inner `attempts` to its own count, which its `attempts` and overall limit
+/// still bound, and reports the sum.
 ///
 /// ```
 /// use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
@@ -628,9 +638,13 @@ impl Endpoint for RateLimited {
 ///
 /// // Two Retry layers of 3 attempts each, under a run allowed 2 retries in all:
 /// // one first try plus two re-issues, never 3 x 3.
-/// let kernel = Kernel::new(Arc::new(Retry::new(Retry::new(leaf, 3), 3))).with_retry_budget(0, 2);
-/// assert!(block_on(kernel.issue(read, &Capability::root())).is_err());
+/// let kernel = Kernel::new(Arc::new(Retry::new(Retry::new(leaf, 3), 3)))
+///     .with_retry_budget(0, 2);
+/// let err = block_on(kernel.issue(read, &Capability::root())).unwrap_err();
 /// assert_eq!(seen.load(Ordering::SeqCst), 3);
+/// // The typed final failure: three calls in all, the last error as its detail.
+/// assert_eq!(err.attempts(), Some(3));
+/// assert!(matches!(&err, Error::GaveUp { detail, .. } if detail == "unavailable: busy"));
 /// ```
 pub struct Retry<S> {
     inner: S,
@@ -896,67 +910,110 @@ impl RetryEndpoint {
             let own = self.time_limit.saturating_sub(elapsed());
             inv.time_left().map_or(own, |left| own.min(left))
         };
-        let exhausted = |attempt| {
-            Error::Timeout(format!(
-                "retry: `{}` exceeded its overall time limit after {attempt} attempts and {} ms",
-                inv.request.target,
-                elapsed().as_millis()
-            ))
+        // `issued` counts the calls made beneath this layer: one per attempt, or an inner
+        // Retry's own count when it answered `GaveUp` (ledger #3385), so nested layers
+        // add their attempts instead of multiplying them.
+        let mut issued: u32 = 0;
+        let mut last: Option<Error> = None;
+        let gave_up = |issued: u32, last: Option<&Error>| match last {
+            Some(error) => give_up(issued, elapsed(), error),
+            None => Error::GaveUp {
+                attempts: issued,
+                elapsed: elapsed(),
+                detail: format!(
+                    "retry: `{}` exceeded its overall time limit",
+                    inv.request.target
+                ),
+            },
         };
-        let mut attempt = 0;
         let mut cap = self.initial_delay;
         loop {
             let left = remaining();
             if left.is_zero() {
-                return Err(exhausted(attempt));
+                // A deadline spent before the first call: nothing was tried.
+                if issued == 0 {
+                    return Err(Error::Timeout(format!(
+                        "retry: `{}` had no time left to make an attempt",
+                        inv.request.target
+                    )));
+                }
+                return Err(gave_up(issued, last.as_ref()));
             }
-            attempt += 1;
             let work = F::call(&*self.inner, inv);
             let deadline = timer.sleep(left);
             futures::pin_mut!(work, deadline);
             let error = match futures::future::select(work, deadline).await {
                 futures::future::Either::Left((Ok(representation), _)) => {
+                    issued = issued.saturating_add(1);
                     return if remaining().is_zero() {
-                        Err(exhausted(attempt))
+                        Err(gave_up(issued, last.as_ref()))
                     } else {
                         Ok(representation)
                     };
                 }
                 futures::future::Either::Left((Err(error), _)) => error,
-                futures::future::Either::Right(_) => return Err(exhausted(attempt)),
+                futures::future::Either::Right(_) => {
+                    issued = issued.saturating_add(1);
+                    return Err(gave_up(issued, last.as_ref()));
+                }
             };
-            if remaining().is_zero() {
-                return Err(exhausted(attempt));
-            }
-            if attempt >= self.attempts {
-                return Err(error);
-            }
+            issued = issued.saturating_add(error.attempts().unwrap_or(1));
+            // A failure this overlay would not repeat comes back as it was received,
+            // never wrapped: `GaveUp` means "retried and stopped".
             let minimum = match repeat(&error) {
                 Repeat::Now => Duration::ZERO,
                 Repeat::After(delay) if self.fits(delay, inv) => delay,
                 Repeat::After(_) | Repeat::Never => return Err(error),
             };
-            if !resend_safe(&*self.inner, inv) {
+            if !resend_safe(&*self.inner, inv) || !attachments_allow_reissue(inv) {
                 return Err(error);
             }
-            if !attachments_allow_reissue(inv) {
-                return Err(error);
+            // A bound stopped a repeatable failure. Wrapped once something was re-issued
+            // (here or in an inner layer), or when the overall limit is what stopped it.
+            let stop = |error: Error| {
+                if issued > 1 {
+                    give_up(issued, elapsed(), &error)
+                } else {
+                    error
+                }
+            };
+            if remaining().is_zero() {
+                return Err(give_up(issued, elapsed(), &error));
+            }
+            if issued >= self.attempts {
+                return Err(stop(error));
             }
             // Spend BEFORE sampling or waiting, so an empty pool costs neither.
             if !spend(inv) {
-                return Err(error);
+                return Err(stop(error));
             }
             let delay = self.jitter.sample(cap).min(cap).max(minimum);
             cap = cap.saturating_mul(2).min(self.maximum_delay);
             let left = remaining();
             if delay >= left {
                 timer.sleep(left).await;
-                return Err(exhausted(attempt));
+                return Err(give_up(issued, elapsed(), &error));
             }
             if !cap.is_zero() || !delay.is_zero() {
                 timer.sleep(delay).await;
             }
+            last = Some(error);
         }
+    }
+}
+
+/// The typed final failure (ledger #3385): `issued` calls over `elapsed`, carrying the
+/// last error's message. An inner layer's `GaveUp` lends its own detail, so nesting
+/// never stacks "gave up after …" prefixes.
+fn give_up(issued: u32, elapsed: Duration, last: &Error) -> Error {
+    let detail = match last {
+        Error::GaveUp { detail, .. } => detail.clone(),
+        other => other.to_string(),
+    };
+    Error::GaveUp {
+        attempts: issued,
+        elapsed,
+        detail,
     }
 }
 

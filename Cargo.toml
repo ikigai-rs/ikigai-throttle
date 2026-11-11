@@ -34,7 +34,10 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 # and ContentStore::put/put_replay are root-only (ledger #2965).
 # 0.3.4 adds `ActionSpec::resend` (ledger #3381): Retry re-sends a Sink only when its
 # contract declares the resend safe, under its key when it names one.
-ikigai-core = "0.3.4"
+# 0.3.5 adds `Error::GaveUp { attempts, elapsed, detail }` (ledger #3386): what Retry
+# returns when it retried and stopped. It does not exist in 0.3.4, so 0.3.5 is the
+# true floor; under 0.x caret rules "0.3.5" is >=0.3.5, <0.4.0.
+ikigai-core = "0.3.5"
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
 # Throttle parks the excess on a fair async Semaphore (runtime-agnostic).
