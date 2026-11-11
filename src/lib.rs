@@ -699,6 +699,8 @@ impl<S: Space> Retry<S> {
     /// Bound all attempts and waits together, including an in-flight async call.
     /// Defaults to 30 seconds; the run's remaining time can only lower this bound.
     /// Like Timeout, this cannot interrupt synchronous work that never yields.
+    /// A completed success wins the race with the timer, even if the clock has
+    /// reached the limit: discarding it could cause an outer layer to resend it.
     pub fn with_time_limit(mut self, limit: Duration) -> Self {
         self.time_limit = limit;
         self
@@ -944,12 +946,9 @@ impl RetryEndpoint {
             futures::pin_mut!(work, deadline);
             let error = match futures::future::select(work, deadline).await {
                 futures::future::Either::Left((Ok(representation), _)) => {
-                    issued = issued.saturating_add(1);
-                    return if remaining().is_zero() {
-                        Err(gave_up(issued, last.as_ref()))
-                    } else {
-                        Ok(representation)
-                    };
+                    // The call completed successfully. Turning it into a transient
+                    // failure at the deadline could make an outer Retry resend it.
+                    return Ok(representation);
                 }
                 futures::future::Either::Left((Err(error), _)) => error,
                 futures::future::Either::Right(_) => {

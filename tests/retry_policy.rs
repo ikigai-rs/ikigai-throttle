@@ -342,19 +342,65 @@ fn one_shared_breaker_opens_across_hosts_and_recovers_after_cooldown() {
 }
 
 #[test]
-fn a_late_ready_success_does_not_escape_the_overall_limit() {
-    let f = Fixture::new();
-    let space = f.space(0, ms(30), false, down());
-    let retry = Retry::new(space, 3)
-        .with_clock(f.clock.clone())
-        .with_timer(f.timer.clone())
-        .with_time_limit(ms(25));
-    assert!(matches!(
-        read(&f.kernel(retry), false),
-        Err(Error::GaveUp { attempts: 1, .. })
-    ));
-    assert_eq!(f.calls(), 1);
-    assert!(f.waits().is_empty());
+fn a_ready_success_is_preserved_at_the_overall_deadline() {
+    for body in [false, true] {
+        for work in [ms(24), ms(25), ms(30)] {
+            for failures in [0, 1] {
+                let f = Fixture::new();
+                let retry = Retry::new(f.space(failures, work, false, down()), 3)
+                    .with_clock(f.clock.clone())
+                    .with_timer(f.timer.clone())
+                    .with_backoff(Duration::ZERO, Duration::ZERO)
+                    .with_time_limit(if failures == 0 { ms(25) } else { work + ms(25) });
+                assert!(
+                    read(&f.kernel(retry), body).is_ok(),
+                    "body={body}, work={work:?}, failures={failures}"
+                );
+                assert_eq!(f.calls(), failures + 1);
+                assert!(f.waits().is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn an_outer_retry_does_not_resend_a_sink_that_succeeded_at_the_inner_deadline() {
+    for body in [false, true] {
+        let f = Fixture::new();
+        let space = EndpointSpace::new().bind(
+            Exact::new("urn:dep"),
+            Flaky {
+                calls: f.calls.clone(),
+                failures: 0,
+                clock: f.clock.clone(),
+                work: ms(25),
+                pending: false,
+                error: down(),
+                contract: Some(
+                    Description::new("successful sink")
+                        .action(ActionSpec::new(Verb::Sink).resend_safe()),
+                ),
+            },
+        );
+        let inner = Retry::new(space, 3)
+            .with_clock(f.clock.clone())
+            .with_timer(f.timer.clone())
+            .with_time_limit(ms(25));
+        let outer = Retry::new(inner, 3)
+            .with_clock(f.clock.clone())
+            .with_timer(f.timer.clone())
+            .with_backoff(Duration::ZERO, Duration::ZERO)
+            .with_time_limit(ms(100));
+        let kernel = Kernel::new(Arc::new(outer)).with_clock(f.clock.clone());
+        let result = if body {
+            block_on(kernel.issue_body(request(Verb::Sink), &Capability::root())).map(|_| ())
+        } else {
+            sink(&kernel, None)
+        };
+        assert_eq!(f.calls(), 1, "a successful Sink must not be sent again");
+        assert!(result.is_ok(), "{result:?}");
+        assert!(f.waits().is_empty());
+    }
 }
 
 #[test]
@@ -587,4 +633,63 @@ fn a_nested_retry_sums_attempts_within_the_outer_limit() {
         }
     );
     assert_eq!(f.calls(), 3);
+}
+
+#[test]
+fn an_empty_shared_pool_stops_before_sampling_or_waiting() {
+    for body in [false, true] {
+        for retries in [0, 1, 2] {
+            let f = Fixture::new();
+            let jitter = Arc::new(Upper::default());
+            let retry = f
+                .retry(u32::MAX, 10)
+                .with_backoff(ms(10), ms(100))
+                .with_jitter(jitter.clone());
+            let kernel = f.kernel(retry).with_retry_budget(retries, retries);
+            let error = read(&kernel, body).unwrap_err();
+            assert_eq!(f.calls(), retries + 1);
+            let waits = match retries {
+                0 => vec![],
+                1 => vec![ms(10)],
+                _ => vec![ms(10), ms(20)],
+            };
+            assert_eq!(f.waits(), waits);
+            assert_eq!(*jitter.0.lock().unwrap(), waits);
+            if retries == 0 {
+                assert_eq!(error, down());
+            } else {
+                assert_eq!(
+                    error,
+                    Error::GaveUp {
+                        attempts: retries + 1,
+                        elapsed: waits.iter().sum(),
+                        detail: down().to_string(),
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_failed_breaker_probe_restarts_the_cooldown_before_recovery() {
+    for body in [false, true] {
+        let f = Fixture::new();
+        let breaker = CircuitBreaker::new(f.space(2, Duration::ZERO, false, down()), 1, ms(50))
+            .with_clock(f.clock.clone());
+        let kernel = Kernel::new(Arc::new(breaker)).with_clock(f.clock.clone());
+        assert_eq!(read(&kernel, body).unwrap_err(), down());
+        f.clock.advance(ms(50));
+        assert_eq!(read(&kernel, body).unwrap_err(), down());
+        f.clock.advance(ms(49));
+        assert_eq!(
+            read(&kernel, body).unwrap_err().retry_after_millis(),
+            Some(1)
+        );
+        assert_eq!(f.calls(), 2);
+        f.clock.advance(ms(1));
+        assert!(read(&kernel, body).is_ok());
+        assert!(read(&kernel, body).is_ok());
+        assert_eq!(f.calls(), 4);
+    }
 }
