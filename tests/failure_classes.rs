@@ -169,8 +169,9 @@ fn every_class_is_represented() {
 }
 
 /// Retry with backoff disabled: a transient failure is re-issued at once, a retry-after one after its delay
-/// (it fits the overlay's own bound here), and every other class is returned on the
-/// first attempt. A `Sink` is never re-sent, whatever the class.
+/// (it fits the overlay's own bound here), and either ends in `GaveUp` when the attempts
+/// run out; every other class is returned unchanged on the first attempt. A `Sink` is
+/// never re-sent, whatever the class, and its error is never wrapped.
 #[test]
 fn retry_decides_from_each_class() {
     for (class, error) in one_of_each_class() {
@@ -184,10 +185,21 @@ fn retry_decides_from_each_class() {
         let kernel = Kernel::new(Arc::new(retry)).with_clock(Arc::new(clock.clone()));
 
         let err = read(&kernel).unwrap_err();
-        assert_eq!(
-            err, error,
-            "{class}: the received error comes back unchanged"
-        );
+        match class {
+            FailureClass::Transient | FailureClass::RetryAfter => assert_eq!(
+                (
+                    err.attempts(),
+                    err.class(),
+                    err.to_string().ends_with(&error.to_string())
+                ),
+                (Some(3), FailureClass::Transient, true),
+                "{class}: retried, then gave up typed: {err:?}"
+            ),
+            _ => assert_eq!(
+                err, error,
+                "{class}: the received error comes back unchanged"
+            ),
+        }
         let (attempts, waits) = match class {
             FailureClass::Transient => (3, vec![]),
             FailureClass::RetryAfter => (3, vec![Duration::from_millis(40); 2]),
@@ -274,14 +286,21 @@ fn nested_retry_layers_spend_one_pool_never_multiplying() {
     let nested = |space: EndpointSpace| retry(retry(space, 3), 3);
     let down = Error::Unavailable("down".into());
 
-    // No pool configured: each layer's own attempts, as before.
+    let gave_up = |attempts| Error::GaveUp {
+        attempts,
+        elapsed: Duration::ZERO,
+        detail: down.to_string(),
+    };
+
+    // No pool configured: the inner layer's GaveUp carries its 3 attempts, which the
+    // outer adds to its own count (ledger #3385), so it is already at its 3 and stops.
     let (space, seen) = failing(&down);
     let kernel = Kernel::new(Arc::new(nested(space)));
-    assert_eq!(read(&kernel).unwrap_err(), down);
+    assert_eq!(read(&kernel).unwrap_err(), gave_up(3));
     assert_eq!(
         seen.load(Ordering::SeqCst),
-        9,
-        "no pool: the layers multiply"
+        3,
+        "no pool: the layers add, never multiply"
     );
 
     // A pool of 2 for the whole run.
@@ -289,8 +308,8 @@ fn nested_retry_layers_spend_one_pool_never_multiplying() {
     let kernel = Kernel::new(Arc::new(nested(space))).with_retry_budget(0, 2);
     assert_eq!(
         read(&kernel).unwrap_err(),
-        down,
-        "the received error, unchanged"
+        gave_up(3),
+        "the attempts the whole tree made"
     );
     assert_eq!(
         seen.load(Ordering::SeqCst),
@@ -384,7 +403,7 @@ fn a_retry_after_longer_than_the_time_left_is_not_waited() {
         ));
         let err = out.unwrap_err();
         if timer.waits().len() == 2 {
-            assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+            assert!(matches!(err, Error::GaveUp { attempts: 2, .. }), "{err:?}");
         } else {
             assert_eq!(
                 err, error,
@@ -447,7 +466,13 @@ fn without_a_deadline_the_own_bound_decides() {
             retry = retry.with_max_wait(bound);
         }
         let kernel = Kernel::new(Arc::new(retry)).with_clock(Arc::new(clock));
-        assert_eq!(read(&kernel).unwrap_err(), limited(delay));
+        let err = read(&kernel).unwrap_err();
+        if attempts > 1 {
+            // Waited, re-issued, and out of attempts: the typed final failure.
+            assert_eq!(err.attempts(), Some(attempts), "{err:?}");
+        } else {
+            assert_eq!(err, limited(delay), "not waited: returned unchanged");
+        }
         assert_eq!(
             seen.load(Ordering::SeqCst),
             attempts,

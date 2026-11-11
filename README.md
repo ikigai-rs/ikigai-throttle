@@ -52,7 +52,7 @@ of this crate's):
   (`Kernel::with_retry_budget`, ceilings granted as `urn:cap:retry:<n>`), every
   re-issue and every failover advance spends from ONE pool shared by the whole
   resolution tree, so nested `Retry` layers cannot multiply their attempts; with the
-  pool spent, an overlay returns the error it received. `attempts` still caps each
+  pool spent, an overlay stops (see **The final failure** below). `attempts` still caps each
   `Retry` layer. A kernel with no retry budget keeps each overlay's own `attempts`.
 
 `Retry::new(space, attempts)` defaults to a 100 ms initial backoff, a 10 second
@@ -80,11 +80,38 @@ simulations. Jitter is for scheduling, not security.
 arrives without its key's value is returned on its first failure, even when a
 caller adds an arbitrary key argument.
 
-**Core API blocker:** core's `Error::Unavailable(String)` cannot carry
-structured attempts and elapsed time. Attempt/pool exhaustion therefore still
-returns the last error; overall elapse returns `Error::Timeout`. Structured final
-failure fields remain blocked on a core error API addition; no prose encoding is
-presented as a typed value. The typed final failure is ledger #3386.
+### The final failure
+
+When `Retry` gives up on a failure it would repeat, because its `attempts`, the
+run's retry pool or its overall time limit ran out, it returns core 0.3.5's
+`Error::GaveUp` (ledger #3385, #3386) instead of the last error:
+
+- `attempts`: how many calls were made, the first one included
+  (`Error::attempts()`);
+- `elapsed`: the time from the first attempt until it gave up, waits included,
+  on the clock installed with `with_clock` (`Error::elapsed_millis()`);
+- `detail`: the last attempt's error as it displayed, or, when the overall limit
+  cut a call short before any error, a sentence naming the target and the limit.
+
+It displays as `gave up after 3 attempts over 300 ms: unavailable: upstream down`,
+its kind is `gave-up`, and its class is transient: a caller may try again later, and
+the numbers say how hard this call already tried.
+
+`GaveUp` means "retried and stopped". A failure `Retry` does not repeat comes back
+unchanged, never wrapped: a refusal, a denial, a permanent or over-budget failure,
+a `Sink` whose contract declares no resend safety, a one-shot attachment, and a
+`RetryAfter` whose delay does not fit (the caller owns that wait). So does a
+repeatable failure stopped before any re-issue, by `attempts` of 1 or an empty
+pool. An overall limit that cuts in after at least one call is always `GaveUp`; a
+run whose deadline had passed before the first call gets a transient `Timeout`.
+
+**How attempts compose.** `GaveUp` is transient, so an outer `Retry` may repeat an
+inner one's. It does not multiply: the outer layer adds the inner `GaveUp`'s
+`attempts` to its own count, and its own `attempts` and overall limit bound that
+sum. `Retry::new(Retry::new(space, 3), 5)` against a dependency that stays down
+makes 3 calls, sees a count of 3, re-issues once, makes 3 more, sees 6 and gives up
+with `attempts: 6` — not 15. The reported `elapsed` is the outer layer's, and the
+`detail` is the innermost error's, never a stack of "gave up" prefixes.
 
 `Retry` and `Failover` re-issue only when every attached input body can reopen.
 A live `Body::Once` attachment skips the retry or failover advance: the overlay
@@ -320,8 +347,8 @@ overlay are the wrapped space's verbatim; a threaded read is cached under the
 wrapped endpoint's thread and cut by a `Sink` through the overlay, a live read stays
 live, a pure read caches with no thread; every typed `Error` an endpoint raises
 comes out of every overlay unchanged when its policy limits permit it (`Retry`
-re-issues a transient one up to `attempts` times and returns the last, or a timeout
-when its overall time limit elapses); each overlay's own refusal is typed as its semantics
+re-issues a transient one up to `attempts` times and then gives up typed with
+`GaveUp`); each overlay's own refusal is typed as its semantics
 say (open circuit: `RetryAfter` for the cooldown left; elapsed budget: transient
 `Timeout`; rate limit: `RetryAfter` until the window opens) and none of them is ever
 cached. `tests/failure_classes.rs` holds every failure class against `Retry`,

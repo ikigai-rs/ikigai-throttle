@@ -215,8 +215,7 @@ fn overall_limit_counts_all_waits_and_starts_no_attempt_at_the_deadline() {
                 .with_time_limit(ms(35)),
         );
         let err = read(&kernel, body).unwrap_err();
-        assert!(matches!(err, Error::Timeout(_)), "{err:?}");
-        assert!(err.to_string().contains("urn:dep"));
+        assert!(matches!(err, Error::GaveUp { attempts: 3, .. }), "{err:?}");
         assert_eq!(f.waits(), [ms(10), ms(20), ms(5)]);
         assert_eq!(f.calls(), 3);
         assert_eq!(f.clock.now(), Time::from_millis(35));
@@ -240,8 +239,21 @@ fn overall_limit_includes_work_and_bounds_a_pending_attempt() {
                 .with_backoff(ms(10), ms(100))
                 .with_jitter(Arc::new(Upper::default()));
             let kernel = f.kernel(retry);
-            assert!(matches!(read(&kernel, body), Err(Error::Timeout(_))));
-            assert_eq!(f.calls(), if pending { 1 } else { 2 });
+            let err = read(&kernel, body).unwrap_err();
+            let attempts = if pending { 1 } else { 2 };
+            assert!(
+                matches!(&err, Error::GaveUp { attempts: a, .. } if *a == attempts),
+                "{err:?}"
+            );
+            // Pending: cut at the limit. Working: the second call's 12 ms ran past it.
+            assert_eq!(err.elapsed_millis(), Some(if pending { 25 } else { 34 }));
+            if pending {
+                // Nothing failed: the detail names the target and the limit.
+                assert!(err
+                    .to_string()
+                    .contains("`urn:dep` exceeded its overall time limit"));
+            }
+            assert_eq!(f.calls(), attempts);
             assert_eq!(f.waits(), if pending { vec![ms(25)] } else { vec![ms(10)] });
         }
     }
@@ -339,7 +351,7 @@ fn a_late_ready_success_does_not_escape_the_overall_limit() {
         .with_time_limit(ms(25));
     assert!(matches!(
         read(&f.kernel(retry), false),
-        Err(Error::Timeout(_))
+        Err(Error::GaveUp { attempts: 1, .. })
     ));
     assert_eq!(f.calls(), 1);
     assert!(f.waits().is_empty());
@@ -448,5 +460,131 @@ fn a_key_captured_from_the_target_counts_as_given() {
     let kernel = f.kernel(f.sink(UriTemplate::parse("urn:orders/{key}").unwrap(), 2, contract));
     let req = Request::new(Verb::Sink, Iri::parse("urn:orders/order-7").unwrap());
     assert!(block_on(kernel.issue(req, &Capability::root())).is_ok());
+    assert_eq!(f.calls(), 3);
+}
+
+// The typed final failure (ledger #3385, core 0.3.5's `Error::GaveUp`).
+
+#[test]
+fn exhausted_attempts_give_up_with_the_count_and_elapsed_time() {
+    for body in [false, true] {
+        let f = Fixture::new();
+        let kernel = f.kernel(
+            f.retry(u32::MAX, 3)
+                .with_backoff(ms(10), ms(100))
+                .with_jitter(Arc::new(Upper::default())),
+        );
+        let err = read(&kernel, body).unwrap_err();
+        assert_eq!(
+            err,
+            Error::GaveUp {
+                attempts: 3,
+                elapsed: ms(30),
+                detail: down().to_string(),
+            }
+        );
+        assert_eq!(err.class(), ikigai_core::FailureClass::Transient);
+        assert_eq!(
+            err.to_string(),
+            "gave up after 3 attempts over 30 ms: unavailable: upstream down"
+        );
+        assert_eq!(f.calls(), 3);
+    }
+}
+
+#[test]
+fn the_overall_limit_gives_up_with_the_count_and_elapsed_time() {
+    for body in [false, true] {
+        let f = Fixture::new();
+        let kernel = f.kernel(
+            f.retry(u32::MAX, 10)
+                .with_backoff(ms(10), ms(100))
+                .with_jitter(Arc::new(Upper::default()))
+                .with_time_limit(ms(35)),
+        );
+        let err = read(&kernel, body).unwrap_err();
+        assert_eq!(
+            err,
+            Error::GaveUp {
+                attempts: 3,
+                elapsed: ms(35),
+                detail: down().to_string(),
+            }
+        );
+    }
+}
+
+#[test]
+fn a_failure_retry_does_not_retry_comes_back_unchanged() {
+    let refused = Error::Refused("no".into());
+    let denied = Error::Denied("not yours".into());
+    for error in [refused, denied] {
+        let f = Fixture::new();
+        let space = f.space(u32::MAX, Duration::ZERO, false, error.clone());
+        let retry = Retry::new(space, 5)
+            .with_clock(f.clock.clone())
+            .with_timer(f.timer.clone());
+        assert_eq!(read(&f.kernel(retry), false).unwrap_err(), error);
+        assert_eq!(f.calls(), 1);
+    }
+    // A Sink that declares no resend safety: sent once, its error unwrapped.
+    let f = Fixture::new();
+    let kernel = f.kernel(f.sink(Exact::new("urn:dep"), u32::MAX, ActionSpec::new(Verb::Sink)));
+    assert_eq!(sink(&kernel, None).unwrap_err(), down());
+    assert_eq!(f.calls(), 1);
+}
+
+#[test]
+fn a_nested_retry_sums_attempts_within_the_outer_limit() {
+    let f = Fixture::new();
+    let inner = Retry::new(f.space(u32::MAX, Duration::ZERO, false, down()), 3)
+        .with_clock(f.clock.clone())
+        .with_timer(f.timer.clone())
+        .with_backoff(ms(10), ms(10))
+        .with_jitter(Arc::new(Upper::default()));
+    let outer = Retry::new(inner, 5)
+        .with_clock(f.clock.clone())
+        .with_timer(f.timer.clone())
+        .with_backoff(ms(10), ms(10))
+        .with_jitter(Arc::new(Upper::default()));
+    let kernel = Kernel::new(Arc::new(outer)).with_clock(f.clock.clone());
+    let err = read(&kernel, false).unwrap_err();
+    // Inner: 3 calls, 2 waits (20 ms). Outer: count 3 < 5, waits 10 ms, inner runs 3
+    // more (20 ms). Outer count 6 >= 5: it gives up. Never 3 x 5 = 15 calls.
+    assert_eq!(f.calls(), 6);
+    assert_eq!(
+        err,
+        Error::GaveUp {
+            attempts: 6,
+            elapsed: ms(50),
+            detail: down().to_string(),
+        }
+    );
+
+    // The outer overall limit bounds the whole tree.
+    let f = Fixture::new();
+    let inner = Retry::new(f.space(u32::MAX, Duration::ZERO, false, down()), 3)
+        .with_clock(f.clock.clone())
+        .with_timer(f.timer.clone())
+        .with_backoff(ms(10), ms(10))
+        .with_jitter(Arc::new(Upper::default()));
+    let outer = Retry::new(inner, 100)
+        .with_clock(f.clock.clone())
+        .with_timer(f.timer.clone())
+        .with_backoff(ms(10), ms(10))
+        .with_jitter(Arc::new(Upper::default()))
+        .with_time_limit(ms(25));
+    let kernel = Kernel::new(Arc::new(outer)).with_clock(f.clock.clone());
+    let err = read(&kernel, false).unwrap_err();
+    // Inner: 3 calls over 20 ms. The outer's 10 ms backoff does not fit the 5 ms left:
+    // it waits them out and gives up, its 100 attempts unused.
+    assert_eq!(
+        err,
+        Error::GaveUp {
+            attempts: 3,
+            elapsed: ms(25),
+            detail: down().to_string(),
+        }
+    );
     assert_eq!(f.calls(), 3);
 }
