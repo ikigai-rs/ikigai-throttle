@@ -6,11 +6,11 @@ and how to report a barrier. It is not a conformance claim. Adapted from the
 
 | Field | Value |
 |---|---|
-| Target | WCAG 2.2 Level AA, for any page that presents this output; this repository writes text only (no HTML, SVG or color) |
+| Target | WCAG 2.2 Level AA, for any page that presents this output; this repository emits text and RDF (no HTML, SVG or color) |
 | Status | Evaluation in progress. No conformance claim. |
 | Owner | the maintainers of this repository |
 | Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-throttle/issues/new?labels=accessibility) with the `accessibility` label; anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-throttle/security/advisories/new) |
-| Last reviewed | 2026-10-31 |
+| Last reviewed | 2026-11-12 |
 
 ## What it emits that people read
 
@@ -43,36 +43,61 @@ Not this repository's: how a host shows any of this, and the display of core's e
 
 ## The rules that output follows
 
-Verified by reading the source:
+Output rules, with current results and exceptions in the table below:
 
-- Every state is a word in the text face (`open`, `half-open`, `closed`, `admitting`, `full`,
-  `answered`, `failed`) and a term in the Turtle face; a count is a number with its noun
+- Circuit, window and route states are words in the text face (`open`, `half-open`,
+  `closed`, `admitting`, `full`, `answered`, `failed`) and terms in the Turtle face; a count is a number with its noun
   (`2 consecutive transient failures`, singular for one).
-- A refusal names what it is about (the prefix, the target, the governor name or the argument)
-  and, where the host can fix it, how (`install one with …::with_clock`, the accepted faces).
-- No color, no terminal control sequences and no markup are written.
+- Rate-limit, circuit-open, timeout and state-face argument refusals name what they are
+  about (the prefix, target, governor name or argument). Missing-facility refusals name the
+  builder that installs it (`install one with …::with_clock`); an unknown face lists the
+  accepted faces. The generic failover refusal names no target, and Retry may carry an
+  upstream error message.
+- Built-in text messages use no color, terminal control sequences or markup. Caller-provided
+  strings and upstream error details are not covered by that statement.
 
 ## How it is tested
 
-- `tests/state.rs`: `the_board_in_text` pins the whole text face byte for byte, and
-  `a_circuit_trips_half_opens_and_closes` pins the `half-open` line; `a_governor_name_is_checked`
-  covers the name refusal; `an_ungranted_caller_learns_nothing` and
-  `a_governor_the_caller_may_not_read_is_not_found` pin that the refusals disclose nothing.
-- `tests/failure_classes.rs` pins the rate-limit refusal's full display
-  (`retry after 60 ms: rate-limited: …`); `tests/conformance.rs` and the unit tests in
-  `src/lib.rs` check that refusals say `rate-limited`, `circuit open` or `timeout`.
+Every named check has a result: Pass, Fail or Blocked, with evidence. A Pass covers only
+that check, not overall accessibility. The checks below were run or reviewed on 2026-11-12
+against main commit `7812f4799dba44773079774b1c527bd458a498d5`, before this documentation
+change. Commands used Cargo 1.99.0 (5f94df478), rustc 1.99.0 (b940084d7), on Linux.
+`cargo test --all-targets` passed (one ignored measurement, not an accessibility check).
+The tests check wording and behavior; none was written as an accessibility evaluation.
+CI repeats the Rust tests, but does not repeat this source review or the example run.
 
-These test wording for correctness; none was written as an accessibility test.
-**No automated accessibility checker, browser or assistive technology has been used on this
-output.**
+| Check | Result | Evidence |
+|---|---|---|
+| Text state face, counts and circuit state words | Pass | `cargo test --all-targets`: `tests/state.rs` tests `the_board_in_text` and `a_circuit_trips_half_opens_and_closes` pin text, singular/plural failure counts and half-open state. Covers fixture output, not how a host presents it. |
+| Turtle state terms and vocabulary | Pass | Same command: `tests/state.rs` tests `the_board_in_turtle`, `every_term_is_described` and `every_term_the_face_writes_is_defined_as_written` check RDF and vocabulary. Does not test a rendered host interface. |
+| Governor-name and nondisclosing state refusals | Pass | Same command: `tests/state.rs` tests `a_governor_name_is_checked`, `an_ungranted_caller_learns_nothing` and `a_governor_the_caller_may_not_read_is_not_found`. Checks fixture errors, not assistive technology usability. |
+| Rate-limit, circuit-open and timeout refusals | Pass | Same command: `tests/failure_classes.rs`, `tests/conformance.rs` and unit tests in `src/lib.rs` check typed refusals and wording, including the rate-limit full display. Does not establish clarity for every reader. |
+| Retry final failure, overall-limit target and missing timing facility guidance | Pass | Same command: `tests/retry_policy.rs` and unit tests in `src/lib.rs` and `src/timeout.rs` check typed `GaveUp`, attempt count, elapsed time, full display, target naming and builder guidance. Injected clocks/timers, no browser. |
+| Half-open concurrent-probe refusal | Pass | Same command: `tests/breaker_concurrency.rs` checks typed `RetryAfter` with unknown delay (`None`) while a probe runs. Does not test its announcement. |
+| State-face argument guidance and built-in text without color or terminal controls | Pass | Source review of `src/state.rs` (`observe`, `face_of`, `absent`, text serialization), message construction in `src/lib.rs` and `src/timeout.rs`, and `examples/throttle-demo.rs` on the main commit above. Built-in text only; caller strings and upstream errors can contain other content. This is a current manual review, not a CI accessibility gate. |
+| Example terminal output | Pass | `cargo run --example throttle-demo`, same toolchain and date: three successes and two refusals with target, rate and delay in words/numbers, no color or redraw. Captured text only; no terminal or assistive technology usability evaluation. |
+| Text grouping independent of indentation | Fail | Current source review of `src/state.rs::text` and the pinned `the_board_in_text` fixture: key lines belong to the governor above by order and two-space indentation; they do not repeat the governor name. No screen reader was used. |
+| Expanded duration wording | Fail | Current source review and `the_board_in_text` fixture use `30s`; timeout construction in `src/timeout.rs` uses `ms`. Pronunciation has not been tested. |
+| Explicit bulkhead state word | Fail | `tests/state.rs::a_bulkhead_shows_running_and_parked_work` and `src/state.rs::key_node` show counts without an explicit admitting/full word in text; Turtle has the state term. |
+| Timeout text explains transient retryability | Fail | Current review of `src/timeout.rs::elapsed`: text only says the target exceeded its budget; the transient failure class is typed, not explained in the message. |
+| Language coverage beyond English | Fail | Current source review of the output constructors above: built-in messages are English only. No localization evaluation was performed. |
+| Automated accessibility checker (axe or equivalent) | Blocked | No checker has been run on this output; no rendered host interface or browser checker is configured here. Rust tests do not replace this check. |
+| Browser rendering, zoom, reflow and contrast | Blocked | No browser evaluation was performed; this library provides text and RDF, and no host page was supplied for evaluation. |
+| Manual keyboard | Blocked | No person performed a keyboard pass; no interactive host interface was available for this review. |
+| Screen reader | Blocked | No screen reader was used; no screen reader session was available for this review. |
+| Screen magnifier | Blocked | No magnifier was used; no magnifier session was available for this review. |
+| Speech input | Blocked | No speech-input software was used; no speech-input session was available for this review. |
+| Switch access | Blocked | No switch-access software was used; no switch-access session was available for this review. |
+| Braille display | Blocked | No braille display was used; no braille hardware was available for this review. |
 
 ## Known limitations
 
-Found by reading the source on 2026-10-31:
+Rechecked against the main commit above on 2026-11-12 by source review, not assistive technology:
 
 - **Nesting is shown by indentation alone.** In the text face a key belongs to the governor
-  above it only because its line starts with two spaces; a screen reader usually does not
-  announce leading spaces, so the grouping is carried by order.
+  above it only because its line starts with two spaces; leading spaces may not
+  be announced by a screen reader, so the grouping is carried by order. This has not been
+  tested with a screen reader here.
 - **Durations are abbreviated** (`30s`, `500ms`), which a screen reader may read as a number and
   a letter.
 - **The bulkhead line does not say its state in a word.** A window line ends `admitting` or
@@ -86,8 +111,10 @@ Found by reading the source on 2026-10-31:
 
 Read this file before changing any output listed above: the state face or a refusal. Keep every
 state a word, keep meaning in words, and name what a refusal is about. A change to the text face
-updates `the_board_in_text` on purpose. Say in the pull request what was tested, with what, and
-what was not.
+updates `the_board_in_text` on purpose. In the pull request, give every check a `Check | Result | Evidence`
+table row with Pass, Fail or Blocked, the test or command and tool version, or why it could
+not run. Include unrun assistive technology checks as Blocked. Historical runs that CI does
+not repeat stay Blocked with their date until rerun; do not treat them as a current Pass.
 
 ## Reporting a barrier
 
@@ -98,10 +125,6 @@ technology you used, if you are comfortable sharing them. Anything security-sens
 through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-throttle/security/advisories/new).
 **We acknowledge a report within 7 days**, and promise nothing further.
 
-Retry timing and refusal tests in `tests/retry_policy.rs` and the unit tests use
-injected clocks/timers. They check the `GaveUp` type, its attempt count, elapsed
-time and full display, target naming, and the missing facility builders. No browser or assistive technology was used for these changes.
-
 ## Change history
 
 | Date | Change |
@@ -109,8 +132,4 @@ time and full display, target naming, and the missing facility builders. No brow
 | 2026-10-31 | First version. |
 | 2026-11-10 | Document retry overall-limit and missing-facility refusals. |
 | 2026-11-11 | Retry's final failure is core's typed `GaveUp`. |
-
-Circuit-breaker concurrency tests in `tests/breaker_concurrency.rs` check the typed
-`RetryAfter` refusal while a half-open probe runs. Its delay is unknown (`None`);
-the existing message still names the governed target. No browser or assistive
-technology was used for these changes.
+| 2026-11-12 | Record current checks as Pass, Fail or Blocked, with evidence and coverage limits; include concurrent-probe refusals. |
