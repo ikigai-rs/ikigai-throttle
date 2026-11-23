@@ -425,6 +425,10 @@ the cooldown.
   asks `meta_failure` before anything is invoked, so there is nothing to re-issue and
   nothing to wait on. The failure is never cached, so the caller's next `Meta` succeeds
   once the peer is back.
+- **`Timeout` honors an earlier run deadline** (0.6.2). A `Timeout` whose budget runs past
+  the run's deadline schedules its timer for the deadline instead, and its refusal names the
+  limit it actually applied. Before, a 250 ms budget under a run with 100 ms left waited the
+  full 250 ms.
 - Still to come: logging, egress-filtering, and load-balancing overlays. Same
   shape, every one.
 
