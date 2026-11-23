@@ -563,6 +563,12 @@ impl Endpoint for RateLimited {
     fn describe(&self) -> Description {
         self.inner.describe()
     }
+
+    /// The inner endpoint's answer, so a `Meta` it cannot state stays an error
+    /// (ikigai-core 0.4.2).
+    fn meta_failure(&self) -> Option<Error> {
+        self.inner.meta_failure()
+    }
 }
 
 /// A [`Space`] overlay that **re-issues** a failed invocation when the failure's
@@ -1037,6 +1043,17 @@ impl Endpoint for RetryEndpoint {
     fn describe(&self) -> Description {
         self.inner.describe()
     }
+
+    /// The inner endpoint's answer, forwarded unchanged and not retried (ikigai-core
+    /// 0.4.2). The kernel asks this synchronously, before anything is invoked and before
+    /// its cache, and a `Meta` never invokes the endpoint: there is no call to re-issue,
+    /// and no timer, run or retry pool to wait on or spend from. So a transient failure
+    /// here is answered at once, never wrapped in `GaveUp`. It is never cached, so the
+    /// caller's next `Meta` asks again and succeeds once the endpoint can state its
+    /// contract.
+    fn meta_failure(&self) -> Option<Error> {
+        self.inner.meta_failure()
+    }
 }
 
 /// Per-target circuit state for [`CircuitBreaker`].
@@ -1370,6 +1387,12 @@ impl Endpoint for BreakerEndpoint {
     fn describe(&self) -> Description {
         self.inner.describe()
     }
+
+    /// The inner endpoint's answer, so a `Meta` it cannot state stays an error
+    /// (ikigai-core 0.4.2).
+    fn meta_failure(&self) -> Option<Error> {
+        self.inner.meta_failure()
+    }
 }
 
 /// A [`Space`] overlay that **fails over** across an ordered list of spaces
@@ -1628,16 +1651,24 @@ struct Candidate {
 impl FailoverEndpoint {
     /// Use the same candidate for the contract and its forwarding metadata. A stub
     /// from an unreachable peer must not hide a later candidate's real contract.
+    ///
+    /// A candidate that can state its contract (no `meta_failure`) is preferred, so a
+    /// `Meta` answered by a backup describes the backup that would answer.
     fn described_candidate(&self) -> Option<(&Candidate, Description)> {
-        self.candidates
-            .iter()
-            .map(|candidate| (candidate, candidate.endpoint.describe()))
-            .find(|(_, description)| !description.action_specs().is_empty())
-            .or_else(|| {
-                self.candidates
-                    .first()
-                    .map(|candidate| (candidate, candidate.endpoint.describe()))
-            })
+        let stated = |healthy_only: bool| {
+            self.candidates
+                .iter()
+                .filter(move |candidate| {
+                    !healthy_only || candidate.endpoint.meta_failure().is_none()
+                })
+                .map(|candidate| (candidate, candidate.endpoint.describe()))
+                .find(|(_, description)| !description.action_specs().is_empty())
+        };
+        stated(true).or_else(|| stated(false)).or_else(|| {
+            self.candidates
+                .first()
+                .map(|candidate| (candidate, candidate.endpoint.describe()))
+        })
     }
 
     /// Walk the candidates on face `F`. On the body face an advance happens only on a
@@ -1714,6 +1745,22 @@ impl Endpoint for FailoverEndpoint {
         self.described_candidate()
             .map(|(_, description)| description)
             .unwrap_or_else(|| Description::new("failover"))
+    }
+
+    /// A `Meta` fails over as a call does (ikigai-core 0.4.2): a candidate that cannot
+    /// state its contract for a transient or retry-after reason is passed over for the
+    /// next, and one that can answers. The last candidate's failure, or the first that
+    /// does not advance, is the answer.
+    fn meta_failure(&self) -> Option<Error> {
+        let last = self.candidates.len().saturating_sub(1);
+        for (i, candidate) in self.candidates.iter().enumerate() {
+            match candidate.endpoint.meta_failure() {
+                None => return None,
+                Some(error) if i < last && advances(&error, Verb::Meta) => {}
+                Some(error) => return Some(error),
+            }
+        }
+        None
     }
 }
 
@@ -1935,6 +1982,12 @@ impl Endpoint for ThrottleEndpoint {
 
     fn describe(&self) -> Description {
         self.inner.describe()
+    }
+
+    /// The inner endpoint's answer, so a `Meta` it cannot state stays an error
+    /// (ikigai-core 0.4.2).
+    fn meta_failure(&self) -> Option<Error> {
+        self.inner.meta_failure()
     }
 }
 

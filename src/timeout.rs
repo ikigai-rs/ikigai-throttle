@@ -219,6 +219,12 @@ impl Endpoint for TimeoutEndpoint {
     fn describe(&self) -> Description {
         self.inner.describe()
     }
+
+    /// The inner endpoint's answer, so a `Meta` it cannot state stays an error
+    /// (ikigai-core 0.4.2).
+    fn meta_failure(&self) -> Option<Error> {
+        self.inner.meta_failure()
+    }
 }
 
 /// A one-shot body under the rest of a [`Timeout`]'s budget: it ends with the timeout
