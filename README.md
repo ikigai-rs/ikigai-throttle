@@ -417,6 +417,14 @@ the cooldown.
   inside an invoke never yields to the executor, so a single-threaded runtime
   can't fire the timer; that hang is fixed at the transport (a socket read
   timeout), complementary to this overlay.
+- **A `Meta` the wrapped endpoint cannot answer stays an error** (0.6.1, ikigai-core
+  0.4.2). Every overlay forwards `Endpoint::meta_failure`, so a `Meta` of a mount whose
+  peer is down answers its `Unavailable` rather than a placeholder contract. Failover
+  passes over a candidate that cannot state its contract for a transient reason, as it
+  does for a call. Retry forwards the failure at once and does not retry it: the kernel
+  asks `meta_failure` before anything is invoked, so there is nothing to re-issue and
+  nothing to wait on. The failure is never cached, so the caller's next `Meta` succeeds
+  once the peer is back.
 - Still to come: logging, egress-filtering, and load-balancing overlays. Same
   shape, every one.
 

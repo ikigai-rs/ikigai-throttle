@@ -2,7 +2,7 @@
 name = "ikigai-throttle"
 description = "Reliability interception overlays for ikigai: RateLimit (per-prefix rate), Retry (re-issue idempotent or declared-resend-safe failures by their failure class, from the run's shared budget), CircuitBreaker (trip open on a failing dependency), Failover (try [primary, backup, ...] on a transient or retry-after failure), Timeout (bound an invocation, transient on elapse), Throttle (cap concurrency, park the excess); logging & load-balancing later."
 # 0.4.0: the public API now uses core 0.3 types (scoped content store, ledger #2965).
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -38,7 +38,7 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 # returns when it retried and stopped. It does not exist in 0.3.4, so 0.3.5 is the
 # true floor; under 0.x caret rules "0.3.5" is >=0.3.5, <0.4.0.
 # core 0.4.0: scope opacity, structured denials; the cascade.
-ikigai-core = "0.4.0"
+ikigai-core = "0.4.2"
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
 # Throttle parks the excess on a fair async Semaphore (runtime-agnostic).
