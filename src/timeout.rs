@@ -26,7 +26,8 @@ use ikigai_core::{
 };
 
 /// A [`Space`] overlay that **bounds how long** an invocation may run. It races the
-/// inner endpoint's invoke against a timer; if the budget elapses first, the work
+/// inner endpoint's invoke against a timer, using the earlier of its budget and the
+/// run's deadline; if that limit elapses first, the work
 /// is dropped and it returns a **transient** [`Timeout`](Error::Timeout) — so a
 /// [`Retry`](crate::Retry)/[`Failover`](crate::Failover) above can move on. Applies
 /// to every verb (a slow `Sink` is bounded too); the re-issue safety of a timed-out
@@ -158,11 +159,11 @@ impl TimeoutEndpoint {
     }
 
     /// What this endpoint answers when its budget elapses.
-    fn elapsed(&self) -> Error {
+    fn elapsed(&self, budget: Duration) -> Error {
         Error::Timeout(format!(
             "`{}` exceeded {}ms",
             self.target,
-            self.budget.as_millis()
+            budget.as_millis()
         ))
     }
 }
@@ -174,15 +175,18 @@ impl Endpoint for TimeoutEndpoint {
         let Some(timer) = &self.timer else {
             return Err(self.untimed());
         };
+        let budget = inv
+            .time_left()
+            .map_or(self.budget, |left| left.min(self.budget));
         let work = self.inner.invoke(inv);
-        let elapse = timer.sleep(self.budget);
+        let elapse = timer.sleep(budget);
         futures::pin_mut!(work);
         futures::pin_mut!(elapse);
         match futures::future::select(work, elapse).await {
             // The work finished within budget.
             Either::Left((result, _timer)) => result,
             // The timer won — drop the in-flight work and report a transient timeout.
-            Either::Right((_elapsed, _work)) => Err(self.elapsed()),
+            Either::Right((_elapsed, _work)) => Err(self.elapsed(budget)),
         }
     }
 
@@ -191,7 +195,9 @@ impl Endpoint for TimeoutEndpoint {
             return Err(self.untimed());
         };
         // Owned, so the same elapse goes on bounding a one-shot body after the call.
-        let budget = self.budget;
+        let budget = inv
+            .time_left()
+            .map_or(self.budget, |left| left.min(self.budget));
         let elapse: BoxFuture<'static, ()> = async move { timer.sleep(budget).await }.boxed();
         let work = self.inner.invoke_body(inv);
         futures::pin_mut!(work);
@@ -200,11 +206,11 @@ impl Endpoint for TimeoutEndpoint {
                 Body::Once(stream) => Body::once(Bounded {
                     inner: Some(stream),
                     elapse,
-                    elapsed: self.elapsed(),
+                    elapsed: self.elapsed(budget),
                 }),
                 complete => complete,
             })),
-            Either::Right((_elapsed, _work)) => Err(self.elapsed()),
+            Either::Right((_elapsed, _work)) => Err(self.elapsed(budget)),
         }
     }
 
@@ -335,6 +341,44 @@ mod tests {
         assert!(err.to_string().contains("urn:dep"), "{err}");
         assert_eq!(*timer.asked.lock().unwrap(), [Duration::from_millis(250)]);
         assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn timer_uses_the_earlier_run_deadline_on_both_faces() {
+        use ikigai_core::{FixedClock, IssueContext, Time};
+
+        for body in [false, true] {
+            for (deadline, expected) in [(100, 100), (500, 250)] {
+                let space = EndpointSpace::new().bind(
+                    Exact::new("urn:dep"),
+                    gated(Arc::new(AtomicBool::new(false)), Arc::default()),
+                );
+                let timer = scripted(true);
+                let kernel = Kernel::new(Arc::new(
+                    Timeout::new(space, Duration::from_millis(250)).with_timer(timer.clone()),
+                ))
+                .with_clock(Arc::new(FixedClock::at(0)));
+                let request = Request::new(Verb::Source, Iri::parse("urn:dep").unwrap());
+                let context = IssueContext::new().with_not_after(Time::from_millis(deadline));
+                let error = if body {
+                    block_on(kernel.issue_body_with_context(request, &Capability::root(), context))
+                        .err()
+                        .unwrap()
+                } else {
+                    block_on(kernel.issue_with_context(request, &Capability::root(), context))
+                        .err()
+                        .unwrap()
+                };
+                assert!(matches!(error, Error::Timeout(_)));
+                assert!(error
+                    .to_string()
+                    .contains(&format!("exceeded {expected}ms")));
+                assert_eq!(
+                    *timer.asked.lock().unwrap(),
+                    [Duration::from_millis(expected)]
+                );
+            }
+        }
     }
 
     /// Work that finishes while the timer has not fired is answered unchanged.
