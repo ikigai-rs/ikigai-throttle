@@ -79,8 +79,7 @@
 //! each governor treats it as it treats a bytes answer.
 //!
 //! The reliability overlays read the request **verb**
-//! ([`Verb::is_idempotent`](ikigai_core::Verb::is_idempotent) governs whether a re-issue
-//! is *safe*) and the failure's [**class**](ikigai_core::Error::class) (whether it is
+//! (idempotence or a declared-safe Sink governs whether a re-issue is *safe*) and the failure's [**class**](ikigai_core::Error::class) (whether it is
 //! *worth* repeating, and when). They decide from core's
 //! [`FailureClass`], never from a table of their own (ledger
 //! #1546, #200):
@@ -1399,9 +1398,9 @@ impl Endpoint for BreakerEndpoint {
 /// `[primary, backup, …]`. It resolves the request against each, then on invoke
 /// tries them in order — advancing to the next only while the failure's
 /// [class](Error::class) is **transient** or **retry-after** (this target is down, or
-/// limited; another one is neither) **and** the verb is
-/// [idempotent](Verb::is_idempotent), since failing a non-idempotent `Sink` over to
-/// another node could double-apply it. Every other class stops immediately: a backup
+/// limited; another one is neither) **and** the call is safe to resend: its verb is
+/// [idempotent](Verb::is_idempotent), or its `Sink` contract declares resend safety
+/// and the call supplies any required key. Every other class stops immediately: a backup
 /// would answer an over-budget, denied, refused, permanent or unknown failure the same
 /// (an over-budget input costs the same anywhere, ledger #972). The DR ladder's core;
 /// wrap a primary in a [`CircuitBreaker`] and its trip-open becomes the *fast* trigger
@@ -1588,19 +1587,17 @@ impl Space for Failover {
     }
 }
 
-/// Whether a [`Failover`] moves past a target that failed with `error` on `verb`: a
-/// transient or retry-after class, for an idempotent verb. A retry-after advances
-/// whatever its delay, since the delay is THIS target's.
-fn advances(error: &Error, verb: Verb) -> bool {
-    verb.is_idempotent()
-        && matches!(
-            error.class(),
-            FailureClass::Transient | FailureClass::RetryAfter
-        )
+/// Whether the failure class permits moving to another target. A retry-after
+/// advances whatever its delay, since the delay is THIS target's.
+fn advances(error: &Error) -> bool {
+    matches!(
+        error.class(),
+        FailureClass::Transient | FailureClass::RetryAfter
+    )
 }
 
 /// The endpoint a [`Failover`] resolves to: try each target in order, advancing on
-/// a transient or retry-after failure of an idempotent verb.
+/// a transient or retry-after failure when resending is safe.
 struct FailoverEndpoint {
     candidates: Vec<Candidate>,
     /// The target every candidate resolved, which the routes are keyed on.
@@ -1698,7 +1695,9 @@ impl FailoverEndpoint {
                     self.ended(candidate, true);
                     return Ok(representation);
                 }
-                Err(e) if i < last && advances(&e, inv.request.verb) => {
+                Err(e)
+                    if i < last && advances(&e) && resend_safe(&*candidate.endpoint, &attempt) =>
+                {
                     // This target is down or limited: try the next, if the run can
                     // afford another issue.
                     if !attachments_allow_reissue(inv) || !spend(inv) {
@@ -1756,7 +1755,7 @@ impl Endpoint for FailoverEndpoint {
         for (i, candidate) in self.candidates.iter().enumerate() {
             match candidate.endpoint.meta_failure() {
                 None => return None,
-                Some(error) if i < last && advances(&error, Verb::Meta) => {}
+                Some(error) if i < last && advances(&error) => {}
                 Some(error) => return Some(error),
             }
         }
