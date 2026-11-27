@@ -4,7 +4,7 @@ description = "Reliability interception overlays for ikigai: RateLimit (per-pref
 # 0.4.0: the public API now uses core 0.3 types (scoped content store, ledger #2965).
 # 0.6.2: Timeout honors an earlier run deadline (ledger #4006): both invocation faces schedule
 # the earlier of the overlay's budget and the run's deadline, and report that limit.
-version = "0.6.2"
+version = "0.7.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -40,7 +40,9 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 # returns when it retried and stopped. It does not exist in 0.3.4, so 0.3.5 is the
 # true floor; under 0.x caret rules "0.3.5" is >=0.3.5, <0.4.0.
 # core 0.4.0: scope opacity, structured denials; the cascade.
-ikigai-core = "0.4.2"
+# 0.5.0 is the true floor for this cascade: Invocation::time_left measures
+# operational time, and public core types must match the host.
+ikigai-core = "0.5.0"
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
 # Throttle parks the excess on a fair async Semaphore (runtime-agnostic).
@@ -82,7 +84,8 @@ futures-timer = "3"
 # 0.14.0 uses core 0.3.0 and its scoped content store (ledger #2965), matching
 # the core types exposed by this crate.
 # 0.15.0 uses core 0.4.0, matching the library.
-ikigai-conformance = "0.15.0"
+# 0.16.0 is the true floor for conformance on core 0.5, matching the library.
+ikigai-conformance = "0.16.0"
 # `tests/state.rs` parses `src/vocabulary.ttl` and the state face's Turtle, to hold the
 # face to its vocabulary (ledger #2175). Both are already in the graph through
 # ikigai-conformance. `TurtleParser::for_slice` is in every oxttl 0.2, which takes
