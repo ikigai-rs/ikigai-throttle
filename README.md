@@ -395,6 +395,17 @@ test in `tests/retry_policy.rs` opens a circuit through one host, observes it op
 through another, checks another mount's target is unaffected, and recovers after
 the cooldown.
 
+## Upgrade to 0.7.0
+
+This minor release uses ikigai-core 0.5.0 and ikigai-conformance 0.16.0.
+Public APIs carrying core types now use the core 0.5 types, so hosts must upgrade
+their core dependency as well. Core now measures `Invocation::time_left` on
+operational time: Retry uses it both to decide whether a retry delay fits and to
+bound the overall attempt, and Timeout uses it on both invocation faces to bound
+the call and streamed body. Operational time is appropriate for all four uses
+because these are real elapsed-time limits, including in a temporal corridor.
+Persisted state is unchanged; no migration is needed.
+
 ## Notes
 
 - **Time comes from a core `Clock`.** `RateLimit` (its window) and
