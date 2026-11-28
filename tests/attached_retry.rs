@@ -1,4 +1,5 @@
 //! Attached input bodies must reopen before Retry or Failover re-issues (#2471).
+use ikigai_core::MonotonicClock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -94,6 +95,7 @@ fn observed_fixture(
     } else {
         Arc::new(
             Retry::new(leaf(), 3)
+                .with_clock(MonotonicClock::native())
                 .with_backoff(Duration::ZERO, Duration::ZERO)
                 .with_timer(Arc::new(NoWait))
                 .with_max_wait(Duration::from_secs(1)),

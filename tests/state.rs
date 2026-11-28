@@ -8,6 +8,7 @@
 //! keeps to its published vocabulary (`src/vocabulary.ttl`, ledger #2175), and the
 //! conformance suite holds the face.
 
+use ikigai_core::MonotonicClock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,11 +76,11 @@ fn host(attach: bool) -> Host {
     let board = StateBoard::new();
     let limit = RateLimit::new(leaf("limit"))
         .limit("urn:demo:limit:", Rate::new(3, Duration::from_secs(10)))
-        .with_clock(Arc::new(clock.clone()))
+        .with_clock(mono(Arc::new(clock.clone())))
         .observed(&board, "limit")
         .unwrap();
     let breaker = CircuitBreaker::new(leaf("breaker"), 2, Duration::from_secs(30))
-        .with_clock(Arc::new(clock.clone()))
+        .with_clock(mono(Arc::new(clock.clone())))
         .observed(&board, "breaker")
         .unwrap();
     let pool = Throttle::new(leaf("pool"))
@@ -303,6 +304,7 @@ fn hostile_prefixes_round_trip_as_raw_strings() {
     let prefix = "urn:x:\"evil> ; a <urn:y> . \\\n\r\t\u{0001} café %22";
     let board = StateBoard::new();
     let limit = RateLimit::new(EndpointSpace::new())
+        .with_clock(MonotonicClock::native())
         .limit(prefix, Rate::new(1, Duration::from_secs(1)))
         .observed(&board, "limit")
         .unwrap();
@@ -460,25 +462,29 @@ fn cached_until_a_change_cuts_it() {
         "another governor's change cuts nothing here"
     );
 
+    // The board hangs from every governor's thread.
+    host.root(STATE);
+    assert!(host.cached(STATE));
+    host.call("urn:demo:dr:x").unwrap();
+    assert!(!host.cached(STATE), "a route's change cut the board");
+
     host.call("urn:demo:limit:ok").unwrap();
     assert!(
         !host.cached(window),
         "a charged hit cut the window's answer"
     );
     assert!(host.root(window).contains("1 of 3"));
-    assert!(host.cached(window));
-
-    // The board hangs from every governor's thread.
-    host.root(STATE);
-    assert!(host.cached(STATE));
-    host.call("urn:demo:dr:x").unwrap();
-    assert!(!host.cached(STATE), "a route's change cut the board");
+    // The hit ages out on the governor's elapsed clock, so the answer stays live
+    // while it is pending (`a_window_ageing_out_keeps_the_answer_live`).
+    assert!(!host.cached(window));
 }
 
-/// A change time alone makes (a hit ageing out of the window) is not a cut: the answer
-/// carries a deadline instead, and it is not served past it.
+/// A change time alone makes (a hit ageing out of the window) is not a cut. It is due on
+/// the governor's elapsed clock, which the kernel's epoch cache deadline cannot carry
+/// without moving on a wall step (ledger #4302), so the answer stays live while it is
+/// pending, and is never served stale past it.
 #[test]
-fn a_window_ageing_out_expires_the_answer() {
+fn a_window_ageing_out_keeps_the_answer_live() {
     let host = host(true);
     let window = "urn:throttle:state:limit:key:urn:demo:limit:";
     host.call("urn:demo:limit:ok").unwrap();
@@ -487,13 +493,14 @@ fn a_window_ageing_out_expires_the_answer() {
             .issue(request(window, None), &Capability::root()),
     )
     .unwrap();
-    assert_eq!(
-        read.expiry,
-        Expiry::At(host.clock.now().plus_millis(10_000))
-    );
-    assert!(host.cached(window));
+    assert_eq!(read.expiry, Expiry::Always);
+    assert!(!host.cached(window));
     host.clock.advance(10_000);
     assert!(host.root(window).contains("0 of 3"), "aged out, not stale");
+    assert!(
+        host.cached(window),
+        "nothing timed is pending: cacheable again"
+    );
 }
 
 /// No kernel attached, nothing can cut: every answer is live.
@@ -564,7 +571,12 @@ impl ikigai_core::Endpoint for Held {
 #[test]
 fn a_governor_name_is_checked() {
     let board = StateBoard::new();
-    let bad = |name: &str| RateLimit::new(leaf("x")).observed(&board, name).err();
+    let bad = |name: &str| {
+        RateLimit::new(leaf("x"))
+            .with_clock(MonotonicClock::native())
+            .observed(&board, name)
+            .err()
+    };
     assert!(bad("Caps").is_some());
     assert!(bad("has:colon").is_some());
     assert!(bad("").is_some());
@@ -575,7 +587,10 @@ fn a_governor_name_is_checked() {
         twice.to_string().contains("already observed as `ok-1`"),
         "{twice}"
     );
-    let once = RateLimit::new(leaf("y")).observed(&board, "first").unwrap();
+    let once = RateLimit::new(leaf("y"))
+        .with_clock(MonotonicClock::native())
+        .observed(&board, "first")
+        .unwrap();
     let again = once.observed(&board, "second").err().unwrap();
     assert!(
         again.to_string().contains("already observed as `first`"),
@@ -588,6 +603,7 @@ fn a_governor_name_is_checked() {
 fn a_limit_added_after_observing_is_shown() {
     let board = StateBoard::new();
     let limit = RateLimit::new(leaf("late"))
+        .with_clock(MonotonicClock::native())
         .observed(&board, "late")
         .unwrap()
         .limit("urn:demo:late:", Rate::new(1, Duration::from_secs(1)));
@@ -611,6 +627,7 @@ fn an_observed_overlay_still_reports_what_it_encloses() {
     let board = StateBoard::new();
     let bare = leaf("t");
     let observed = CircuitBreaker::new(leaf("t"), 1, Duration::from_secs(1))
+        .with_clock(MonotonicClock::native())
         .observed(&board, "t")
         .unwrap();
     assert_eq!(observed.id(), bare.id());
@@ -975,6 +992,7 @@ fn every_term_the_face_writes_is_defined_as_written() {
 fn conforms() {
     let board = StateBoard::new();
     let limit = RateLimit::new(EndpointSpace::new())
+        .with_clock(MonotonicClock::native())
         .limit(
             "urn:x:\"evil> ; a <urn:y> .",
             Rate::new(1, Duration::from_secs(1)),
@@ -1067,6 +1085,7 @@ fn measure() {
     let governed = |observed: bool, attach: bool, read_between: bool| {
         let board = StateBoard::new();
         let mut limit = RateLimit::new(leaf("hot"))
+            .with_clock(MonotonicClock::native())
             .limit("urn:demo:hot:", Rate::new(u32::MAX, Duration::from_secs(1)));
         if observed {
             limit = limit.observed(&board, "hot").unwrap();
@@ -1100,4 +1119,12 @@ fn measure() {
         "governed call + governor read, observed, attached (a cut per call): {:.2} us",
         governed(true, true, true)
     );
+}
+
+/// Read a test's counter clock through core's elapsed host adapter, as a wasm host
+/// reads its own elapsed source: governors take a `MonotonicClock`, never a wall `Clock`.
+fn mono<C: ikigai_core::Clock + 'static>(clock: std::sync::Arc<C>) -> ikigai_core::MonotonicClock {
+    ikigai_core::MonotonicClock::from_host(move || {
+        std::time::Duration::from_millis(clock.now().as_millis())
+    })
 }

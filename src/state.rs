@@ -58,9 +58,10 @@
 //! (`urn:throttle:governor:{governor}`, [`governor_thread`]). A governor cuts it on every change its face shows:
 //! a hit charged to a window, a failure counted or a circuit tripped or closed, work
 //! starting, parking or finishing, a failover ending at another candidate. Changes that
-//! time alone makes (a hit ageing out of a window, a cooldown running out) cut nothing;
-//! the answer's deadline is the soonest of them, measured on the governor's clock and set
-//! on the kernel's, so give the governors the kernel's clock. A governor cuts only when
+//! time alone makes (a hit ageing out of a window, a cooldown running out) cut nothing,
+//! so while one is pending the answer is live: it is due on the governor's elapsed
+//! [`MonotonicClock`](ikigai_core::MonotonicClock), and a deadline set on the kernel's
+//! epoch clock would move with a wall step (ledger #4302). A governor cuts only when
 //! something has read its face since its last cut, so an unread board costs the governed
 //! path one atomic swap per change.
 
@@ -120,13 +121,14 @@ type Cutter = Arc<dyn Fn(&str) + Send + Sync>;
 /// use std::{sync::Arc, time::Duration};
 /// use futures::executor::block_on;
 /// use ikigai_core::{Capability, EndpointSpace, Exact, Fallback, FnEndpoint, Iri, Kernel,
-///     ReprType, Representation, Request, Space, Verb};
+///     MonotonicClock, ReprType, Representation, Request, Space, Verb};
 /// use ikigai_throttle::{Rate, RateLimit, StateBoard};
 ///
 /// let ok = FnEndpoint::new("x", |_| Ok(Representation::new(ReprType::new("text/plain"), "ok")));
 /// let board = StateBoard::new();
 /// let governed = RateLimit::new(EndpointSpace::new().bind(Exact::new("urn:demo:x"), ok))
 ///     .limit("urn:demo:", Rate::new(3, Duration::from_secs(10)))
+///     .with_clock(MonotonicClock::native())
 ///     .observed(&board, "demo")
 ///     .unwrap();
 /// // The state is a space of its own, mounted BESIDE the governed one.
@@ -634,17 +636,17 @@ impl StateFace {
         for (name, _) in readings {
             representation = representation.depends_on(governor_thread(name));
         }
-        let soonest = readings.iter().filter_map(|(_, r)| r.next_change).min();
-        match soonest {
-            None => representation.cacheable(),
-            Some(left) => match inv.now() {
-                Some(now) if !left.is_zero() => {
-                    representation.cacheable_until(now.plus_millis(crate::millis(left)))
-                }
-                // Due now, or no kernel time to set a deadline on: stay live.
-                _ => representation,
-            },
+        // A change time alone will make (a hit ageing out, a cooldown ending) is due
+        // on the governor's elapsed clock, which has no epoch reading. The kernel's
+        // cache deadline is an epoch `Time`, so a deadline set there would move with
+        // a wall step: a backward step would serve `full` or `open` past the elapsed
+        // end (ledger #4302). Until core files an answer on an elapsed deadline, an
+        // answer with a timed change pending stays live.
+        let _ = inv;
+        if readings.iter().any(|(_, r)| r.next_change.is_some()) {
+            return representation;
         }
+        representation.cacheable()
     }
 }
 

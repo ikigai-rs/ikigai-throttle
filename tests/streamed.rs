@@ -14,6 +14,7 @@
 //! A buffer or a replayable body is complete when it is handed over, and each governor
 //! treats it as it treats a bytes answer.
 
+use ikigai_core::MonotonicClock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -168,13 +169,18 @@ fn every_overlay_hands_a_one_shot_body_over_one_shot() {
             kernel(
                 RateLimit::new(leaf())
                     .limit("urn:", Rate::new(10, Duration::from_secs(1)))
-                    .with_clock(clock()),
+                    .with_clock(mono(clock())),
             ),
         ),
-        ("Retry", kernel(Retry::new(leaf(), 3))),
+        (
+            "Retry",
+            kernel(Retry::new(leaf(), 3).with_clock(MonotonicClock::native())),
+        ),
         (
             "CircuitBreaker",
-            kernel(CircuitBreaker::new(leaf(), 1, Duration::from_secs(1)).with_clock(clock())),
+            kernel(
+                CircuitBreaker::new(leaf(), 1, Duration::from_secs(1)).with_clock(mono(clock())),
+            ),
         ),
         (
             "Failover",
@@ -245,7 +251,7 @@ fn retry_reissues_before_the_body_and_never_after() {
         1 => Err(Error::Unavailable("busy".into())),
         _ => Ok(once(&["ok"])),
     });
-    let kernel = kernel(Retry::new(leaf, 3));
+    let kernel = kernel(Retry::new(leaf, 3).with_clock(MonotonicClock::native()));
     let body = issue_body(&kernel).unwrap();
     assert!(body.bytes.is_one_shot());
     assert_eq!(drain(body.bytes).unwrap(), b"ok");
@@ -253,7 +259,7 @@ fn retry_reissues_before_the_body_and_never_after() {
 
     // A failure part-way through a one-shot body is the reader's: nothing re-issues it.
     let (leaf, calls) = streams(|_| Ok(failing(&["par"], Error::Unavailable("reset".into()))));
-    let kernel = self::kernel(Retry::new(leaf, 3));
+    let kernel = self::kernel(Retry::new(leaf, 3).with_clock(MonotonicClock::native()));
     let body = issue_body(&kernel).unwrap();
     assert_eq!(
         drain(body.bytes),
@@ -297,7 +303,7 @@ fn circuit_breaker_counts_a_mid_stream_failure_and_a_clean_end() {
         _ => Ok(once(&["fine"])),
     });
     let clock = Arc::new(FixedClock::at(1_000));
-    let breaker = CircuitBreaker::new(leaf, 1, Duration::from_secs(30)).with_clock(clock);
+    let breaker = CircuitBreaker::new(leaf, 1, Duration::from_secs(30)).with_clock(mono(clock));
     let kernel = kernel(breaker);
 
     // Handed over: nothing is counted until the body ends.
@@ -322,7 +328,8 @@ fn circuit_breaker_closes_on_a_body_read_to_its_end() {
     });
     let clock = Arc::new(FixedClock::at(1_000));
     // Threshold 2: one failure, then a success must reset the count, or the third trips.
-    let kernel = kernel(CircuitBreaker::new(leaf, 2, Duration::from_secs(30)).with_clock(clock));
+    let kernel =
+        kernel(CircuitBreaker::new(leaf, 2, Duration::from_secs(30)).with_clock(mono(clock)));
     assert!(issue_body(&kernel).is_err());
     assert_eq!(drain(issue_body(&kernel).unwrap().bytes).unwrap(), b"fine");
     assert_eq!(
@@ -370,4 +377,12 @@ fn a_buffer_is_complete_when_handed_over() {
     let held = issue_body(&kernel).unwrap();
     assert!(!held.bytes.is_one_shot());
     assert!(issue_body(&kernel).is_ok(), "a buffer released its slot");
+}
+
+/// Read a test's counter clock through core's elapsed host adapter, as a wasm host
+/// reads its own elapsed source: governors take a `MonotonicClock`, never a wall `Clock`.
+fn mono<C: ikigai_core::Clock + 'static>(clock: std::sync::Arc<C>) -> ikigai_core::MonotonicClock {
+    ikigai_core::MonotonicClock::from_host(move || {
+        std::time::Duration::from_millis(clock.now().as_millis())
+    })
 }

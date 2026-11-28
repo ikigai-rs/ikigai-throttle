@@ -19,6 +19,7 @@
 //! broke, and an overlay added later without one is the bug this file exists to
 //! stop from recurring.
 
+use ikigai_core::MonotonicClock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -138,19 +139,28 @@ fn rate_limit_forwards_the_canonical() {
     // resolves to an erroring endpoint — nothing to cache — so it is guarded at the
     // resolution level in `every_overlay_forwards_a_reported_canonical` below.
     one_resource_through("RateLimit", |inner| {
-        Arc::new(RateLimit::new(inner).limit("urn:", Rate::new(1000, Duration::from_secs(60))))
+        Arc::new(
+            RateLimit::new(inner)
+                .with_clock(MonotonicClock::native())
+                .limit("urn:", Rate::new(1000, Duration::from_secs(60))),
+        )
     });
 }
 
 #[test]
 fn retry_forwards_the_canonical() {
-    one_resource_through("Retry", |inner| Arc::new(Retry::new(inner, 3)));
+    one_resource_through("Retry", |inner| {
+        Arc::new(Retry::new(inner, 3).with_clock(MonotonicClock::native()))
+    });
 }
 
 #[test]
 fn circuit_breaker_forwards_the_canonical() {
     one_resource_through("CircuitBreaker", |inner| {
-        Arc::new(CircuitBreaker::new(inner, 3, Duration::from_millis(50)))
+        Arc::new(
+            CircuitBreaker::new(inner, 3, Duration::from_millis(50))
+                .with_clock(MonotonicClock::native()),
+        )
     });
 }
 
@@ -207,6 +217,7 @@ fn every_overlay_forwards_a_reported_canonical() {
     // invoke, so it never caches anything — but it is still THIS resource, and it
     // is one of the six sites that used to rebuild the `Resolved`.
     let over_budget = RateLimit::new(rewriting("urn:iki:store:x"))
+        .with_clock(MonotonicClock::native())
         .limit("urn:", Rate::new(1, Duration::from_secs(60)));
     assert_eq!(
         canonical_of(&over_budget),
@@ -222,15 +233,16 @@ fn every_overlay_forwards_a_reported_canonical() {
     let overlays: Vec<(&str, Arc<dyn Space>)> = vec![
         (
             "Retry",
-            Arc::new(Retry::new(rewriting("urn:iki:store:x"), 3)),
+            Arc::new(
+                Retry::new(rewriting("urn:iki:store:x"), 3).with_clock(MonotonicClock::native()),
+            ),
         ),
         (
             "CircuitBreaker",
-            Arc::new(CircuitBreaker::new(
-                rewriting("urn:iki:store:x"),
-                3,
-                Duration::from_millis(50),
-            )),
+            Arc::new(
+                CircuitBreaker::new(rewriting("urn:iki:store:x"), 3, Duration::from_millis(50))
+                    .with_clock(MonotonicClock::native()),
+            ),
         ),
         (
             "Failover",

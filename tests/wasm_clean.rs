@@ -5,11 +5,13 @@
 //! thread and futures-timer's native `Delay` all COMPILE and then fail at runtime.
 //! So CI's `wasm32 lib clippy` job cannot see one of them creep back into a
 //! governor: it would build green and panic on the first governed call in a
-//! browser. This guard is the check that can. Time belongs to a core `Clock`
-//! (`with_clock`); the platform is read only in `native_clock` (the native
-//! default clock) and `native_timer` (the native default timer a `Retry` waits a
-//! `RetryAfter` on and a `Timeout` races its budget against), both declared behind
-//! `cfg(not(target_arch = "wasm32"))`. `timeout` was a third until it took an injected
+//! browser. This guard is the check that can. Elapsed time belongs to a core
+//! `MonotonicClock` the host injects (`with_clock`, ledger #4302), and no governor
+//! installs `MonotonicClock::native()` itself; the platform is read only in
+//! `native_timer` (the native default timer a `Retry` waits a `RetryAfter` on and a
+//! `Timeout` races its budget against), declared behind
+//! `cfg(not(target_arch = "wasm32"))`. `native_clock`, the old implicit native clock,
+//! is gone (ledger #4302). `timeout` was a third until it took an injected
 //! `Timer` (ledger #2189); this guard now holds it to that.
 //!
 //! Comment lines are skipped, so prose and doctests (which run natively) may name
@@ -19,10 +21,12 @@
 use std::path::Path;
 
 /// Modules that may read the platform, each declared native-only in `lib.rs`.
-const NATIVE_ONLY: [&str; 2] = ["native_clock", "native_timer"];
+const NATIVE_ONLY: [&str; 1] = ["native_timer"];
 
 /// What compiles on wasm32 and fails there at runtime.
-const PLATFORM_TIME: [&str; 5] = [
+/// Matched as whole identifiers, so core's `MonotonicInstant` is not `Instant`.
+const PLATFORM_TIME: [&str; 6] = [
+    "MonotonicClock::native",
     "Instant",
     "SystemTime",
     "futures_timer",
@@ -46,6 +50,16 @@ fn code(text: &str) -> Vec<(usize, &str)> {
         .collect()
 }
 
+/// Whether `line` names `token` as a whole identifier path.
+fn mentions(line: &str, token: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    line.match_indices(token).any(|(at, _)| {
+        let before = line[..at].chars().next_back();
+        let after = line[at + token.len()..].chars().next();
+        !before.is_some_and(ident) && !after.is_some_and(ident)
+    })
+}
+
 #[test]
 fn only_the_native_modules_read_platform_time() {
     let mut offenders = Vec::new();
@@ -58,7 +72,7 @@ fn only_the_native_modules_read_platform_time() {
         let text = std::fs::read_to_string(&file).expect("read");
         for (n, line) in code(&text) {
             for token in PLATFORM_TIME {
-                if line.contains(token) {
+                if mentions(line, token) {
                     offenders.push(format!("src/{stem}.rs:{n}: `{token}` in `{}`", line.trim()));
                 }
             }
@@ -67,7 +81,7 @@ fn only_the_native_modules_read_platform_time() {
     assert!(
         offenders.is_empty(),
         "platform time read outside the native-only modules; take it from the \
-         governor's core Clock instead:\n{}",
+         host-injected MonotonicClock instead:\n{}",
         offenders.join("\n")
     );
 }

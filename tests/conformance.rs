@@ -116,6 +116,7 @@
 
 use futures::executor::block_on;
 use ikigai_conformance::{Check, Checks, Report, SpaceNaming, Suite};
+use ikigai_core::MonotonicClock;
 use ikigai_core::{
     ActionSpec, ArgRef, ArgSpec, Capability, Clock, Description, Endpoint, EndpointSpace, Error,
     Exact, Expiry, FailureClass, FnEndpoint, Invocation, Iri, Kernel, ReprType, Representation,
@@ -284,13 +285,28 @@ fn overlays() -> Vec<(&'static str, Compose, u32)> {
     vec![
         (
             "RateLimit",
-            |inner| Arc::new(RateLimit::new(inner).limit("urn:", generous())),
+            |inner| {
+                Arc::new(
+                    RateLimit::new(inner)
+                        .with_clock(MonotonicClock::native())
+                        .limit("urn:", generous()),
+                )
+            },
             1,
         ),
-        ("Retry", |inner| Arc::new(Retry::new(inner, 3)), 3),
+        (
+            "Retry",
+            |inner| Arc::new(Retry::new(inner, 3).with_clock(MonotonicClock::native())),
+            3,
+        ),
         (
             "CircuitBreaker",
-            |inner| Arc::new(CircuitBreaker::new(inner, 5, Duration::from_millis(50))),
+            |inner| {
+                Arc::new(
+                    CircuitBreaker::new(inner, 5, Duration::from_millis(50))
+                        .with_clock(MonotonicClock::native()),
+                )
+            },
             1,
         ),
         ("Failover", |inner| Arc::new(Failover::new(vec![inner])), 1),
@@ -308,14 +324,20 @@ fn overlays() -> Vec<(&'static str, Compose, u32)> {
             "stack",
             |inner| {
                 let primary = CircuitBreaker::new(
-                    Retry::new(Timeout::new(inner, Duration::from_secs(5)), 3),
+                    Retry::new(Timeout::new(inner, Duration::from_secs(5)), 3)
+                        .with_clock(MonotonicClock::native()),
                     5,
                     Duration::from_millis(50),
-                );
+                )
+                .with_clock(MonotonicClock::native());
                 let resilient = Failover::new(vec![Arc::new(primary)]);
                 Arc::new(
-                    Throttle::new(RateLimit::new(resilient).limit("urn:", generous()))
-                        .limit("urn:", 4),
+                    Throttle::new(
+                        RateLimit::new(resilient)
+                            .with_clock(MonotonicClock::native())
+                            .limit("urn:", generous()),
+                    )
+                    .limit("urn:", 4),
                 )
             },
             3,
@@ -799,7 +821,9 @@ fn refusals_are_typed_and_never_cached() {
     // opens), not transient, reaches nothing.
     let leaf = Leaf::new();
     let kernel = Kernel::new(Arc::new(
-        RateLimit::new(leaf.space()).limit("urn:", Rate::new(0, Duration::from_secs(60))),
+        RateLimit::new(leaf.space())
+            .with_clock(MonotonicClock::native())
+            .limit("urn:", Rate::new(0, Duration::from_secs(60))),
     ));
     let err = source(&kernel, "urn:cell", &[]).unwrap_err();
     assert!(
@@ -819,7 +843,9 @@ fn refusals_are_typed_and_never_cached() {
     // charged for it. A live read over budget is refused.
     let leaf = Leaf::new();
     let kernel = Kernel::new(Arc::new(
-        RateLimit::new(leaf.space()).limit("urn:", Rate::new(1, Duration::from_secs(60))),
+        RateLimit::new(leaf.space())
+            .with_clock(MonotonicClock::native())
+            .limit("urn:", Rate::new(1, Duration::from_secs(60))),
     ));
     assert_eq!(source(&kernel, "urn:cell", &[]).unwrap().bytes, b"one");
     assert_eq!(
@@ -854,7 +880,7 @@ fn refusals_are_typed_and_never_cached() {
     let clock = Manual::default();
     let kernel = Kernel::new(Arc::new(
         CircuitBreaker::new(inner, 2, Duration::from_millis(30))
-            .with_clock(Arc::new(clock.clone())),
+            .with_clock(mono(Arc::new(clock.clone()))),
     ));
     for _ in 0..2 {
         let err = source(&kernel, "urn:dep", &[]).unwrap_err();
@@ -919,7 +945,9 @@ fn refusals_are_typed_and_never_cached() {
 fn an_over_budget_refusal_keeps_the_wrapped_contract() {
     let leaf = Leaf::new();
     let kernel = Kernel::new(Arc::new(
-        RateLimit::new(leaf.space()).limit("urn:", Rate::new(0, Duration::from_secs(60))),
+        RateLimit::new(leaf.space())
+            .with_clock(MonotonicClock::native())
+            .limit("urn:", Rate::new(0, Duration::from_secs(60))),
     ));
     let description = kernel.describe_pattern("urn:gated").unwrap();
     assert_eq!(description.action_specs()[0].requires, [READ_CAP]);
@@ -956,7 +984,9 @@ fn an_over_budget_refusal_keeps_the_wrapped_contract() {
 #[test]
 fn over_budget_the_only_findings_are_the_reads_a_refusal_cannot_serve() {
     let kernel = Kernel::new(Arc::new(
-        RateLimit::new(Leaf::new().space()).limit("urn:", Rate::new(0, Duration::from_secs(60))),
+        RateLimit::new(Leaf::new().space())
+            .with_clock(MonotonicClock::native())
+            .limit("urn:", Rate::new(0, Duration::from_secs(60))),
     ));
     let report = suite().run_blocking(&kernel);
     eprintln!("over budget: {report}");
@@ -994,4 +1024,12 @@ fn over_budget_the_only_findings_are_the_reads_a_refusal_cannot_serve() {
         assert!(finding.detail.contains(needed_by), "{finding}");
     }
     assert_eq!(report.findings.len(), 5, "{report}");
+}
+
+/// Read a test's counter clock through core's elapsed host adapter, as a wasm host
+/// reads its own elapsed source: governors take a `MonotonicClock`, never a wall `Clock`.
+fn mono<C: ikigai_core::Clock + 'static>(clock: std::sync::Arc<C>) -> ikigai_core::MonotonicClock {
+    ikigai_core::MonotonicClock::from_host(move || {
+        std::time::Duration::from_millis(clock.now().as_millis())
+    })
 }

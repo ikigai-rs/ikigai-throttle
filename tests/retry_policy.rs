@@ -128,7 +128,7 @@ impl Fixture {
             },
         );
         Retry::new(space, 5)
-            .with_clock(self.clock.clone())
+            .with_clock(mono(self.clock.clone()))
             .with_timer(self.timer.clone())
     }
     fn retry(&self, failures: u32, attempts: u32) -> Retry<EndpointSpace> {
@@ -136,7 +136,7 @@ impl Fixture {
             self.space(failures, Duration::ZERO, false, down()),
             attempts,
         )
-        .with_clock(self.clock.clone())
+        .with_clock(mono(self.clock.clone()))
         .with_timer(self.timer.clone())
     }
     fn kernel(&self, retry: Retry<EndpointSpace>) -> Kernel {
@@ -233,7 +233,7 @@ fn overall_limit_includes_work_and_bounds_a_pending_attempt() {
                 down(),
             );
             let retry = Retry::new(space, 10)
-                .with_clock(f.clock.clone())
+                .with_clock(mono(f.clock.clone()))
                 .with_timer(f.timer.clone())
                 .with_time_limit(ms(25))
                 .with_backoff(ms(10), ms(100))
@@ -271,7 +271,7 @@ fn retry_after_is_a_minimum_not_shortened_by_jitter_or_cap() {
         },
     );
     let retry = Retry::new(space, 3)
-        .with_clock(f.clock.clone())
+        .with_clock(mono(f.clock.clone()))
         .with_timer(f.timer.clone())
         .with_max_wait(ms(100))
         .with_backoff(ms(10), ms(20))
@@ -315,7 +315,8 @@ fn one_shared_breaker_opens_across_hosts_and_recovers_after_cooldown() {
         Arc::new(f.space(1, Duration::ZERO, false, down())),
         Arc::new(other),
     ]);
-    let breaker = Arc::new(CircuitBreaker::new(spaces, 1, ms(50)).with_clock(f.clock.clone()));
+    let breaker =
+        Arc::new(CircuitBreaker::new(spaces, 1, ms(50)).with_clock(mono(f.clock.clone())));
     let mounts = || {
         ikigai_core::Fallback::new(vec![
             Arc::new(ikigai_core::Mount::new("urn:dep", breaker.clone())),
@@ -348,7 +349,7 @@ fn a_ready_success_is_preserved_at_the_overall_deadline() {
             for failures in [0, 1] {
                 let f = Fixture::new();
                 let retry = Retry::new(f.space(failures, work, false, down()), 3)
-                    .with_clock(f.clock.clone())
+                    .with_clock(mono(f.clock.clone()))
                     .with_timer(f.timer.clone())
                     .with_backoff(Duration::ZERO, Duration::ZERO)
                     .with_time_limit(if failures == 0 { ms(25) } else { work + ms(25) });
@@ -383,11 +384,11 @@ fn an_outer_retry_does_not_resend_a_sink_that_succeeded_at_the_inner_deadline() 
             },
         );
         let inner = Retry::new(space, 3)
-            .with_clock(f.clock.clone())
+            .with_clock(mono(f.clock.clone()))
             .with_timer(f.timer.clone())
             .with_time_limit(ms(25));
         let outer = Retry::new(inner, 3)
-            .with_clock(f.clock.clone())
+            .with_clock(mono(f.clock.clone()))
             .with_timer(f.timer.clone())
             .with_backoff(Duration::ZERO, Duration::ZERO)
             .with_time_limit(ms(100));
@@ -491,7 +492,7 @@ fn a_permanent_failure_of_a_safe_sink_is_not_repeated() {
         },
     );
     let retry = Retry::new(space, 5)
-        .with_clock(f.clock.clone())
+        .with_clock(mono(f.clock.clone()))
         .with_timer(f.timer.clone());
     assert!(sink(&f.kernel(retry), None).is_err());
     assert_eq!(f.calls(), 1);
@@ -568,7 +569,7 @@ fn a_failure_retry_does_not_retry_comes_back_unchanged() {
         let f = Fixture::new();
         let space = f.space(u32::MAX, Duration::ZERO, false, error.clone());
         let retry = Retry::new(space, 5)
-            .with_clock(f.clock.clone())
+            .with_clock(mono(f.clock.clone()))
             .with_timer(f.timer.clone());
         assert_eq!(read(&f.kernel(retry), false).unwrap_err(), error);
         assert_eq!(f.calls(), 1);
@@ -584,12 +585,12 @@ fn a_failure_retry_does_not_retry_comes_back_unchanged() {
 fn a_nested_retry_sums_attempts_within_the_outer_limit() {
     let f = Fixture::new();
     let inner = Retry::new(f.space(u32::MAX, Duration::ZERO, false, down()), 3)
-        .with_clock(f.clock.clone())
+        .with_clock(mono(f.clock.clone()))
         .with_timer(f.timer.clone())
         .with_backoff(ms(10), ms(10))
         .with_jitter(Arc::new(Upper::default()));
     let outer = Retry::new(inner, 5)
-        .with_clock(f.clock.clone())
+        .with_clock(mono(f.clock.clone()))
         .with_timer(f.timer.clone())
         .with_backoff(ms(10), ms(10))
         .with_jitter(Arc::new(Upper::default()));
@@ -610,12 +611,12 @@ fn a_nested_retry_sums_attempts_within_the_outer_limit() {
     // The outer overall limit bounds the whole tree.
     let f = Fixture::new();
     let inner = Retry::new(f.space(u32::MAX, Duration::ZERO, false, down()), 3)
-        .with_clock(f.clock.clone())
+        .with_clock(mono(f.clock.clone()))
         .with_timer(f.timer.clone())
         .with_backoff(ms(10), ms(10))
         .with_jitter(Arc::new(Upper::default()));
     let outer = Retry::new(inner, 100)
-        .with_clock(f.clock.clone())
+        .with_clock(mono(f.clock.clone()))
         .with_timer(f.timer.clone())
         .with_backoff(ms(10), ms(10))
         .with_jitter(Arc::new(Upper::default()))
@@ -676,7 +677,7 @@ fn a_failed_breaker_probe_restarts_the_cooldown_before_recovery() {
     for body in [false, true] {
         let f = Fixture::new();
         let breaker = CircuitBreaker::new(f.space(2, Duration::ZERO, false, down()), 1, ms(50))
-            .with_clock(f.clock.clone());
+            .with_clock(mono(f.clock.clone()));
         let kernel = Kernel::new(Arc::new(breaker)).with_clock(f.clock.clone());
         assert_eq!(read(&kernel, body).unwrap_err(), down());
         f.clock.advance(ms(50));
@@ -692,4 +693,12 @@ fn a_failed_breaker_probe_restarts_the_cooldown_before_recovery() {
         assert!(read(&kernel, body).is_ok());
         assert_eq!(f.calls(), 4);
     }
+}
+
+/// Read a test's counter clock through core's elapsed host adapter, as a wasm host
+/// reads its own elapsed source: governors take a `MonotonicClock`, never a wall `Clock`.
+fn mono<C: ikigai_core::Clock + 'static>(clock: std::sync::Arc<C>) -> ikigai_core::MonotonicClock {
+    ikigai_core::MonotonicClock::from_host(move || {
+        std::time::Duration::from_millis(clock.now().as_millis())
+    })
 }

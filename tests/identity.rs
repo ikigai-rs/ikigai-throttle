@@ -13,6 +13,7 @@
 //! space that allocates a fresh endpoint per resolution cannot grow the memo
 //! without bound or keep the dropped endpoints alive.
 
+use ikigai_core::MonotonicClock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -60,12 +61,17 @@ fn stable(name: &str, space: &dyn Space, target: &str) {
 
 #[test]
 fn retry_resolves_to_one_wrapper() {
-    stable("Retry", &Retry::new(leaf(), 3), "urn:demo:x");
+    stable(
+        "Retry",
+        &Retry::new(leaf(), 3).with_clock(MonotonicClock::native()),
+        "urn:demo:x",
+    );
 }
 
 #[test]
 fn circuit_breaker_resolves_to_one_wrapper() {
-    let overlay = CircuitBreaker::new(leaf(), 3, Duration::from_secs(1));
+    let overlay =
+        CircuitBreaker::new(leaf(), 3, Duration::from_secs(1)).with_clock(MonotonicClock::native());
     stable("CircuitBreaker", &overlay, "urn:demo:x");
 }
 
@@ -100,7 +106,9 @@ fn failover_resolves_to_one_wrapper() {
 /// prefix resolves the same refusal, and it still refuses as a rate limit.
 #[test]
 fn rate_limits_stand_in_resolves_to_one_wrapper() {
-    let overlay = RateLimit::new(leaf()).limit("urn:demo:", Rate::new(0, Duration::from_secs(60)));
+    let overlay = RateLimit::new(leaf())
+        .with_clock(MonotonicClock::native())
+        .limit("urn:demo:", Rate::new(0, Duration::from_secs(60)));
     stable("RateLimit (over budget)", &overlay, "urn:demo:x");
 
     let kernel = Kernel::new(Arc::new(overlay));
@@ -124,9 +132,11 @@ fn a_stack_of_governors_resolves_to_one_wrapper() {
             Timeout::new(leaf(), Duration::from_secs(1)),
             3,
             Duration::from_secs(1),
-        ),
+        )
+        .with_clock(MonotonicClock::native()),
         2,
-    );
+    )
+    .with_clock(MonotonicClock::native());
     stable("Retry(CircuitBreaker(Timeout))", &stack, "urn:demo:x");
 }
 
@@ -151,7 +161,8 @@ impl Space for Swappable {
 #[test]
 fn a_rebound_endpoint_gets_a_new_wrapper() {
     let swappable = Arc::new(Swappable(Mutex::new(Arc::new(ok("old")))));
-    let overlay = Arc::new(Retry::new(Arc::clone(&swappable), 3));
+    let overlay =
+        Arc::new(Retry::new(Arc::clone(&swappable), 3).with_clock(MonotonicClock::native()));
     let before = resolved(&*overlay, "urn:demo:x");
 
     *swappable.0.lock().unwrap() = Arc::new(ok("new"));
@@ -176,7 +187,8 @@ fn a_rebound_endpoint_gets_a_new_wrapper() {
 fn a_per_target_wrapper_is_per_target() {
     let templated =
         EndpointSpace::new().bind(UriTemplate::parse("urn:dep/{id}").unwrap(), ok("dep"));
-    let overlay = CircuitBreaker::new(templated, 1, Duration::from_secs(60));
+    let overlay = CircuitBreaker::new(templated, 1, Duration::from_secs(60))
+        .with_clock(MonotonicClock::native());
     let a = resolved(&overlay, "urn:dep/a");
     let b = resolved(&overlay, "urn:dep/b");
     assert!(!Arc::ptr_eq(&a, &b), "two targets, two breakers");

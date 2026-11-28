@@ -13,6 +13,7 @@
 //! retry pool). Retry forwards the failure unchanged, at once, and spends nothing. The
 //! failure is never cached, so the next `Meta` asks again and succeeds once the endpoint
 //! can state its contract.
+use ikigai_core::MonotonicClock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -112,14 +113,18 @@ fn overlays(peer: &Peer) -> Vec<(&'static str, Arc<dyn Space>)> {
             Arc::new(
                 RateLimit::new(peer.space())
                     .limit("urn:", Rate::new(100, Duration::from_secs(1)))
-                    .with_clock(clock()),
+                    .with_clock(mono(clock())),
             ),
         ),
-        ("Retry", Arc::new(Retry::new(peer.space(), 3))),
+        (
+            "Retry",
+            Arc::new(Retry::new(peer.space(), 3).with_clock(MonotonicClock::native())),
+        ),
         (
             "CircuitBreaker",
             Arc::new(
-                CircuitBreaker::new(peer.space(), 3, Duration::from_secs(1)).with_clock(clock()),
+                CircuitBreaker::new(peer.space(), 3, Duration::from_secs(1))
+                    .with_clock(mono(clock())),
             ),
         ),
         (
@@ -137,17 +142,20 @@ fn overlays(peer: &Peer) -> Vec<(&'static str, Arc<dyn Space>)> {
         (
             "stack",
             Arc::new(Timeout::new(
-                Throttle::new(Retry::new(
-                    CircuitBreaker::new(
-                        RateLimit::new(Failover::new(vec![Arc::new(peer.space())]))
-                            .limit("urn:", Rate::new(100, Duration::from_secs(1)))
-                            .with_clock(clock()),
+                Throttle::new(
+                    Retry::new(
+                        CircuitBreaker::new(
+                            RateLimit::new(Failover::new(vec![Arc::new(peer.space())]))
+                                .limit("urn:", Rate::new(100, Duration::from_secs(1)))
+                                .with_clock(mono(clock())),
+                            3,
+                            Duration::from_secs(1),
+                        )
+                        .with_clock(mono(clock())),
                         3,
-                        Duration::from_secs(1),
                     )
-                    .with_clock(clock()),
-                    3,
-                ))
+                    .with_clock(MonotonicClock::native()),
+                )
                 .limit("urn:", 2),
                 Duration::from_secs(30),
             )),
@@ -248,7 +256,7 @@ fn retry_answers_a_meta_failure_at_once_and_the_next_meta_recovers() {
     let peer = Peer::new();
     let timer = Arc::new(Recording::default());
     let retry = Retry::new(peer.space(), 3)
-        .with_clock(clock())
+        .with_clock(mono(clock()))
         .with_timer(timer.clone());
     let kernel = kernel_over(Arc::new(retry));
 
@@ -289,4 +297,12 @@ fn failover_answers_the_meta_failure_when_no_candidate_can_state_its_contract() 
     assert!(matches!(meta(&kernel), Err(Error::Unavailable(_))));
     backup.recover();
     assert!(real(&meta(&kernel).unwrap()), "the backup came up");
+}
+
+/// Read a test's counter clock through core's elapsed host adapter, as a wasm host
+/// reads its own elapsed source: governors take a `MonotonicClock`, never a wall `Clock`.
+fn mono<C: ikigai_core::Clock + 'static>(clock: std::sync::Arc<C>) -> ikigai_core::MonotonicClock {
+    ikigai_core::MonotonicClock::from_host(move || {
+        std::time::Duration::from_millis(clock.now().as_millis())
+    })
 }

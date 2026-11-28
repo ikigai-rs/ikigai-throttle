@@ -42,13 +42,16 @@
 //! through a governor to the doors it guards. [`Failover`], enclosing several,
 //! is reported opaque; see its `topology`.
 //!
-//! **Time comes from a core [`Clock`]**, never from the platform directly. The
-//! governors measuring windows and cooldowns, [`RateLimit`] and [`CircuitBreaker`],
-//! and [`Retry`] measuring its overall limit, read the clock given with `with_clock`.
-//! They default to a monotonic clock on a native target. On wasm32-unknown-unknown, where Rust's own
-//! platform time panics (a browser has a clock, but only behind JavaScript imports this
-//! library does not make), there is no default: the host installs a clock as it does
-//! for its kernel, and a governor without one refuses rather than guessing.
+//! **Intervals are measured on a core [`MonotonicClock`] the host injects**, never on
+//! epoch time and never on the platform directly (ledger #4302, core's time design). The
+//! governors measuring windows and cooldowns, [`RateLimit`] and [`CircuitBreaker`], and
+//! [`Retry`] measuring its overall limit, read the elapsed clock given with `with_clock`,
+//! on both the admission path and the state face, so a wall-clock step (NTP, a laptop
+//! waking) moves neither a window's end nor a cooldown's. No clock is installed
+//! implicitly on any target: a native host passes `MonotonicClock::native()`, a wasm
+//! host `MonotonicClock::from_host` over its own elapsed reader (`performance.now()`),
+//! and a governor without one refuses rather than guessing. The run's deadline
+//! ([`Invocation::time_left`]) stays the kernel's.
 //! [`Timeout`] and [`Retry`] wait on a [`Timer`], which a clock cannot be, injected the
 //! same way (`with_timer`; ledger #2189). Every overlay here builds for wasm32.
 //!
@@ -149,48 +152,49 @@ use state::{Circuit, Key, Kind, Observed, Reading, Watch};
 pub const VOCABULARY_TTL: &str = include_str!("vocabulary.ttl");
 
 #[cfg(not(target_arch = "wasm32"))]
-mod native_clock;
-#[cfg(not(target_arch = "wasm32"))]
 mod native_timer;
 mod timeout;
 pub use timeout::Timeout;
 
 use ikigai_core::{
-    ActionSpec, ArgRef, Bindings, Body, Clock, Description, Endpoint, Error, FailureClass, Forward,
-    InputSource, Invocation, Iri, Representation, Request, Resolution, Resolved, Scope, Space,
-    SpaceEntry, Time, Topology, Verb,
+    ActionSpec, ArgRef, Bindings, Body, Description, Endpoint, Error, FailureClass, Forward,
+    InputSource, Invocation, Iri, MonotonicClock, MonotonicInstant, Representation, Request,
+    Resolution, Resolved, Scope, Space, SpaceEntry, Topology, Verb,
 };
 use std::sync::Arc;
 
-/// The clock a governor reads when its host installed none: on a native target a
-/// monotonic one (the private `native_clock` module); on wasm32 none at all, because
-/// there is no platform time to read there without a host, and reading it anyway is
-/// a runtime panic. A governor that has no clock REFUSES what it governs, naming
-/// `with_clock`, rather than guessing at time (see [`RateLimit::with_clock`]).
-fn default_clock() -> Option<Arc<dyn Clock>> {
-    #[cfg(not(target_arch = "wasm32"))]
-    let clock: Option<Arc<dyn Clock>> = Some(Arc::new(native_clock::Monotonic::new()));
-    #[cfg(target_arch = "wasm32")]
-    let clock: Option<Arc<dyn Clock>> = None;
-    clock
-}
-
-/// A duration in whole milliseconds, the resolution of a core [`Time`].
+/// A duration in whole milliseconds, for a refusal's delay and the state face.
 pub(crate) fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Milliseconds from `since` to `now`; zero if the clock reads earlier than `since`
-/// (a host's clock is allowed to, and a governor must not panic or wrap on it).
-fn elapsed(now: Time, since: Time) -> u64 {
-    now.as_millis().saturating_sub(since.as_millis())
+/// Elapsed time from `since` to `now` on the governor's [`MonotonicClock`]. Both come
+/// from one source, so the only error is an instant from a clock replaced since it
+/// was taken (`with_clock` after a resolution): that instant measures nothing on the
+/// new source, so it counts as long past, which ages a hit out and cools a circuit,
+/// rather than holding either open forever.
+fn elapsed(now: &MonotonicInstant, since: &MonotonicInstant) -> Duration {
+    now.saturating_duration_since(since)
+        .unwrap_or(Duration::MAX)
+}
+
+/// A retry delay rounded UP to whole milliseconds, the resolution a `RetryAfter`
+/// displays: elapsed time is finer than that, and a floored delay would send a waited
+/// retry back a fraction early, into the same refusal.
+fn wait_at_least(delay: Duration) -> Duration {
+    let floor = Duration::from_millis(millis(delay));
+    if floor < delay {
+        floor.saturating_add(Duration::from_millis(1))
+    } else {
+        floor
+    }
 }
 
 /// Drop the hits in `window` that are a whole `rate.window` old or older at `now`.
-fn slide(window: &mut VecDeque<Time>, now: Time, rate: Rate) {
+fn slide(window: &mut VecDeque<MonotonicInstant>, now: &MonotonicInstant, rate: Rate) {
     while window
         .front()
-        .is_some_and(|&t| elapsed(now, t) >= millis(rate.window))
+        .is_some_and(|t| elapsed(now, t) >= rate.window)
     {
         window.pop_front();
     }
@@ -232,15 +236,15 @@ impl Rate {
 /// ```
 /// use std::{sync::Arc, time::Duration};
 /// use futures::executor::block_on;
-/// use ikigai_core::{Capability, EndpointSpace, Error, Exact, FailureClass, FixedClock,
-///     FnEndpoint, Iri, Kernel, ReprType, Representation, Request, Verb};
+/// use ikigai_core::{Capability, EndpointSpace, Error, Exact, FailureClass, FnEndpoint,
+///     Iri, Kernel, MonotonicClock, ReprType, Representation, Request, Verb};
 /// use ikigai_throttle::{Rate, RateLimit};
 ///
 /// let ok = FnEndpoint::new("x", |_| Ok(Representation::new(ReprType::new("text/plain"), b"ok".to_vec())));
 /// let kernel = Kernel::new(Arc::new(
 ///     RateLimit::new(EndpointSpace::new().bind(Exact::new("urn:demo:x"), ok))
 ///         .limit("urn:demo:", Rate::new(1, Duration::from_secs(10)))
-///         .with_clock(Arc::new(FixedClock::at(1_000))),
+///         .with_clock(MonotonicClock::from_host(|| Duration::from_secs(1))),
 /// ));
 /// let read = || block_on(kernel.issue(
 ///     Request::new(Verb::Source, Iri::parse("urn:demo:x").unwrap()),
@@ -260,9 +264,9 @@ pub struct RateLimit<S> {
     rules: Vec<(String, Rate)>,
     /// Shared with every over-budget stand-in, which reads its retry hint here
     /// when it refuses rather than carrying one fixed when it was built.
-    hits: Arc<Mutex<HashMap<String, VecDeque<Time>>>>,
+    hits: Arc<Mutex<HashMap<String, VecDeque<MonotonicInstant>>>>,
     /// Where the window's time comes from: see [`with_clock`](Self::with_clock).
-    clock: Option<Arc<dyn Clock>>,
+    clock: Option<MonotonicClock>,
     /// One stand-in per (wrapped endpoint, limited prefix): see [`memo`].
     stand_ins: Wrappers<(usize, String), RateLimited>,
     /// How a charged hit reaches the state face: see [`observed`](Self::observed).
@@ -276,7 +280,7 @@ impl<S: Space> RateLimit<S> {
             inner,
             rules: Vec::new(),
             hits: Arc::new(Mutex::new(HashMap::new())),
-            clock: default_clock(),
+            clock: None,
             stand_ins: Wrappers::new(),
             watch: Watch::new(),
         }
@@ -300,24 +304,23 @@ impl<S: Space> RateLimit<S> {
         })
     }
 
-    /// Measure the window on `clock` (builder), instead of the default: a monotonic
-    /// clock on a native target, and **none on wasm32**, where a host must install
-    /// one. Without a clock, every resolution under a limited prefix is refused with
-    /// a permanent [`Error::Endpoint`] that names this method; nothing panics.
+    /// Measure the window on `clock` (builder), an elapsed-time source the host
+    /// injects. **There is no default on any target**: without a clock, every
+    /// resolution under a limited prefix is refused with a permanent
+    /// [`Error::Endpoint`] that names this method; nothing panics. A native host
+    /// passes `MonotonicClock::native()`; a wasm host, `MonotonicClock::from_host`
+    /// over its own elapsed reader; a test, a host reader it advances itself.
     ///
-    /// Give it the clock the host gave its kernel (`Kernel::with_clock`) when the two
-    /// should agree, or a test clock that advances only when the test says so. Time
-    /// is read in whole milliseconds, a core [`Time`]'s resolution, so a window
-    /// shorter than a millisecond is not meaningful.
-    ///
-    /// Not the request scope's clock: a temporal corridor pins time for the DOMAIN
-    /// (an as-of read), and a window measured on a pinned clock would never slide.
-    /// How fast a prefix is being hit is operational time, which core keeps on the
-    /// kernel's clock for the same reason (ledger #517).
+    /// Elapsed, never epoch: a hit's instant is opaque and bound to this source, so a
+    /// wall-clock step cannot expire a window early or hold it open past its end.
+    /// Not the request scope's clock either: a temporal corridor pins time for the
+    /// DOMAIN (an as-of read), and a window measured on a pinned clock would never
+    /// slide. Call it before the first resolution: a stand-in built by then keeps the
+    /// clock it was built with.
     ///
     /// ```
-    /// use ikigai_core::{Capability, EndpointSpace, Exact, FixedClock, FnEndpoint,
-    ///     Iri, Kernel, ReprType, Representation, Request, Verb};
+    /// use ikigai_core::{Capability, EndpointSpace, Exact, FnEndpoint, Iri, Kernel,
+    ///     MonotonicClock, ReprType, Representation, Request, Verb};
     /// use ikigai_throttle::{Rate, RateLimit};
     /// use std::{sync::Arc, time::Duration};
     ///
@@ -329,7 +332,7 @@ impl<S: Space> RateLimit<S> {
     /// let kernel = Kernel::new(Arc::new(
     ///     RateLimit::new(leaf)
     ///         .limit("urn:demo:", Rate::new(1, Duration::from_millis(1)))
-    ///         .with_clock(Arc::new(FixedClock::at(1_000))),
+    ///         .with_clock(MonotonicClock::from_host(|| Duration::from_secs(1))),
     /// ));
     /// let read = || futures::executor::block_on(kernel.issue(
     ///     Request::new(Verb::Source, Iri::parse("urn:demo:x").unwrap()),
@@ -339,7 +342,7 @@ impl<S: Space> RateLimit<S> {
     /// std::thread::sleep(Duration::from_millis(5));
     /// assert!(read().is_err(), "the window is measured on the clock it was given");
     /// ```
-    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+    pub fn with_clock(mut self, clock: MonotonicClock) -> Self {
         self.clock = Some(clock);
         self.watch.refresh(self.view());
         self
@@ -382,7 +385,7 @@ impl<S: Space> Space for RateLimit<S> {
         let now = self.clock.as_ref().map(|clock| clock.now());
         let mut hits = self.hits.lock().expect("throttle lock");
         let window = hits.entry(prefix.clone()).or_default();
-        if let Some(now) = now {
+        if let Some(now) = &now {
             slide(window, now, *rate);
         }
         if now.is_none() || window.len() as u32 >= rate.max {
@@ -475,9 +478,9 @@ struct RateLimited {
     inner: Arc<dyn Endpoint>,
     prefix: String,
     rate: Rate,
-    hits: Arc<Mutex<HashMap<String, VecDeque<Time>>>>,
+    hits: Arc<Mutex<HashMap<String, VecDeque<MonotonicInstant>>>>,
     /// The governor's clock; `None` is the refusal for having none.
-    clock: Option<Arc<dyn Clock>>,
+    clock: Option<MonotonicClock>,
     /// The governor's: a hit charged here changes its window too.
     watch: Arc<Watch>,
 }
@@ -489,19 +492,17 @@ impl RateLimited {
     /// plausible operator input, and it is over budget on an EMPTY window. (Unwrapping
     /// the front there once panicked on the first resolve instead of refusing; a
     /// governor must refuse, never panic.)
-    fn admit(&self, now: Time) -> Result<(), Option<Duration>> {
+    fn admit(&self, now: MonotonicInstant) -> Result<(), Option<Duration>> {
         let mut hits = self.hits.lock().expect("throttle lock");
         let window = hits.entry(self.prefix.clone()).or_default();
-        slide(window, now, self.rate);
+        slide(window, &now, self.rate);
         if (window.len() as u32) < self.rate.max {
             window.push_back(now);
             return Ok(());
         }
-        Err(window.front().map(|&t| {
-            self.rate
-                .window
-                .saturating_sub(Duration::from_millis(elapsed(now, t)))
-        }))
+        Err(window
+            .front()
+            .map(|t| wait_at_least(self.rate.window.saturating_sub(elapsed(&now, t)))))
     }
 }
 
@@ -629,7 +630,8 @@ impl Endpoint for RateLimited {
 /// ```
 /// use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 /// use futures::executor::block_on;
-/// use ikigai_core::{Capability, EndpointSpace, Error, Exact, FnEndpoint, Iri, Kernel, Request, Verb};
+/// use ikigai_core::{Capability, EndpointSpace, Error, Exact, FnEndpoint, Iri, Kernel,
+///     MonotonicClock, Request, Verb};
 /// use ikigai_throttle::Retry;
 ///
 /// let seen = Arc::new(AtomicU32::new(0));
@@ -643,7 +645,10 @@ impl Endpoint for RateLimited {
 ///
 /// // Two Retry layers of 3 attempts each, under a run allowed 2 retries in all:
 /// // one first try plus two re-issues, never 3 x 3.
-/// let kernel = Kernel::new(Arc::new(Retry::new(Retry::new(leaf, 3), 3)))
+/// // No clock is installed implicitly: the host passes its elapsed source.
+/// let clock = MonotonicClock::native();
+/// let inner = Retry::new(leaf, 3).with_clock(clock.clone());
+/// let kernel = Kernel::new(Arc::new(Retry::new(inner, 3).with_clock(clock)))
 ///     .with_retry_budget(0, 2);
 /// let err = block_on(kernel.issue(read, &Capability::root())).unwrap_err();
 /// assert_eq!(seen.load(Ordering::SeqCst), 3);
@@ -658,7 +663,7 @@ pub struct Retry<S> {
     timer: Option<Arc<dyn Timer>>,
     /// The longest delay waited when the run has no deadline.
     max_wait: Option<Duration>,
-    clock: Option<Arc<dyn Clock>>,
+    clock: Option<MonotonicClock>,
     initial_delay: Duration,
     maximum_delay: Duration,
     time_limit: Duration,
@@ -676,7 +681,7 @@ impl<S: Space> Retry<S> {
             attempts: attempts.max(1),
             timer: timer::default_timer(),
             max_wait: None,
-            clock: default_clock(),
+            clock: None,
             initial_delay: Duration::from_millis(100),
             maximum_delay: Duration::from_secs(10),
             time_limit: Duration::from_secs(30),
@@ -685,9 +690,12 @@ impl<S: Space> Retry<S> {
         }
     }
 
-    /// Measure elapsed time with the kernel's clock. Tests should install the same
-    /// clock in their timer and kernel. Configure before the first resolution.
-    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+    /// Measure the overall limit on `clock` (builder), an elapsed-time source the host
+    /// injects; there is no default on any target, and without one Retry refuses,
+    /// naming this method. The run's deadline stays the kernel's
+    /// ([`Invocation::time_left`]). Tests should drive this clock, the kernel's and
+    /// their timer from one counter. Configure before the first resolution.
+    pub fn with_clock(mut self, clock: MonotonicClock) -> Self {
         self.clock = Some(clock);
         self
     }
@@ -867,7 +875,7 @@ struct RetryEndpoint {
     attempts: u32,
     timer: Option<Arc<dyn Timer>>,
     max_wait: Option<Duration>,
-    clock: Option<Arc<dyn Clock>>,
+    clock: Option<MonotonicClock>,
     initial_delay: Duration,
     maximum_delay: Duration,
     time_limit: Duration,
@@ -911,8 +919,7 @@ impl RetryEndpoint {
             )));
         };
         let start = clock.now();
-        let elapsed =
-            || Duration::from_millis(clock.now().as_millis().saturating_sub(start.as_millis()));
+        let elapsed = || elapsed(&clock.now(), &start);
         let remaining = || {
             let own = self.time_limit.saturating_sub(elapsed());
             inv.time_left().map_or(own, |left| own.min(left))
@@ -1061,7 +1068,7 @@ struct Breaker {
     /// Consecutive transient failures while closed.
     failures: u32,
     /// When the circuit tripped open, if it is open.
-    opened_at: Option<Time>,
+    opened_at: Option<MonotonicInstant>,
     /// Invalidates outcomes admitted before the latest trip or recovery.
     generation: u64,
     /// Only one half-open call (including its one-shot body) owns the probe.
@@ -1100,14 +1107,14 @@ struct Breaker {
 /// ```
 /// use std::{sync::Arc, time::Duration};
 /// use futures::executor::block_on;
-/// use ikigai_core::{Capability, EndpointSpace, Error, Exact, FixedClock, FnEndpoint, Iri,
-///     Kernel, Request, Verb};
+/// use ikigai_core::{Capability, EndpointSpace, Error, Exact, FnEndpoint, Iri, Kernel,
+///     MonotonicClock, Request, Verb};
 /// use ikigai_throttle::CircuitBreaker;
 ///
 /// let down = FnEndpoint::new("down", |_| Err(Error::Unavailable("down".into())));
 /// let kernel = Kernel::new(Arc::new(
 ///     CircuitBreaker::new(EndpointSpace::new().bind(Exact::new("urn:dep"), down), 1, Duration::from_secs(30))
-///         .with_clock(Arc::new(FixedClock::at(1_000))),
+///         .with_clock(MonotonicClock::from_host(|| Duration::from_secs(1))),
 /// ));
 /// let read = || block_on(kernel.issue(
 ///     Request::new(Verb::Source, Iri::parse("urn:dep").unwrap()),
@@ -1124,7 +1131,7 @@ pub struct CircuitBreaker<S> {
     cooldown: Duration,
     states: Arc<Mutex<HashMap<String, Breaker>>>,
     /// Where the cooldown's time comes from: see [`with_clock`](Self::with_clock).
-    clock: Option<Arc<dyn Clock>>,
+    clock: Option<MonotonicClock>,
     /// One wrapper per (inner endpoint, target), since a wrapper carries the
     /// target its circuit is keyed on: see [`memo`].
     wrappers: Wrappers<(usize, u64), BreakerEndpoint>,
@@ -1141,7 +1148,7 @@ impl<S: Space> CircuitBreaker<S> {
             threshold: threshold.max(1),
             cooldown,
             states: Arc::new(Mutex::new(HashMap::new())),
-            clock: default_clock(),
+            clock: None,
             wrappers: Wrappers::new(),
             watch: Watch::new(),
         }
@@ -1167,16 +1174,15 @@ impl<S: Space> CircuitBreaker<S> {
         })
     }
 
-    /// Measure the cooldown on `clock` (builder), instead of the default: a
-    /// monotonic clock on a native target, and **none on wasm32**, where a host must
-    /// install one. Without a clock the breaker refuses every call with a permanent
-    /// [`Error::Endpoint`] naming this method, before touching the dependency;
-    /// nothing panics. The same reasoning as [`RateLimit::with_clock`]: the
-    /// kernel's clock or a test clock, never a temporal corridor's pinned one.
+    /// Measure the cooldown on `clock` (builder), an elapsed-time source the host
+    /// injects. **There is no default on any target**: without a clock the breaker
+    /// refuses every call with a permanent [`Error::Endpoint`] naming this method,
+    /// before touching the dependency; nothing panics. The same reasoning as
+    /// [`RateLimit::with_clock`]: a wall-clock step moves no cooldown's end.
     ///
     /// Call it before the first resolution: a wrapper built by then keeps the clock
     /// it was built with.
-    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+    pub fn with_clock(mut self, clock: MonotonicClock) -> Self {
         self.clock = Some(clock);
         self.watch.refresh(self.view());
         self
@@ -1223,7 +1229,7 @@ impl<S: Space> Space for CircuitBreaker<S> {
 struct BreakerEndpoint {
     inner: Arc<dyn Endpoint>,
     cooldown: Duration,
-    clock: Option<Arc<dyn Clock>>,
+    clock: Option<MonotonicClock>,
     /// Shared with a one-shot body in flight, which updates the circuit when it ends.
     tally: Arc<Tally>,
 }
@@ -1294,13 +1300,13 @@ impl BreakerEndpoint {
         let mut states = self.tally.states.lock().expect("breaker lock");
         let mut probe = false;
         if let Some(breaker) = states.get_mut(&self.tally.target) {
-            if let Some(opened) = breaker.opened_at {
-                let cooled = elapsed(clock.now(), opened);
-                if breaker.probing || cooled < millis(self.cooldown) {
+            if let Some(opened) = &breaker.opened_at {
+                let cooled = elapsed(&clock.now(), opened);
+                if breaker.probing || cooled < self.cooldown {
                     return Err(Error::RetryAfter {
                         // An in-flight probe has no known completion time.
                         delay: (!breaker.probing)
-                            .then(|| self.cooldown.saturating_sub(Duration::from_millis(cooled))),
+                            .then(|| wait_at_least(self.cooldown.saturating_sub(cooled))),
                         detail: format!("circuit open for `{}`", self.tally.target),
                     });
                 }
@@ -1311,7 +1317,7 @@ impl BreakerEndpoint {
         }
         Ok(BreakerCall {
             tally: Arc::clone(&self.tally),
-            clock: Arc::clone(clock),
+            clock: clock.clone(),
             generation: states.get(&self.tally.target).map_or(0, |b| b.generation),
             probe,
         })
@@ -1322,7 +1328,7 @@ impl BreakerEndpoint {
 /// Cancellation or an unread body releases admission without inventing an outcome.
 struct BreakerCall {
     tally: Arc<Tally>,
-    clock: Arc<dyn Clock>,
+    clock: MonotonicClock,
     generation: u64,
     probe: bool,
 }
@@ -2012,8 +2018,8 @@ fn first_per_prefix<T: Clone>(rules: &[(String, T)]) -> Vec<(String, T)> {
 struct RateLimitView {
     governs: Option<Iri>,
     rules: Vec<(String, Rate)>,
-    hits: Arc<Mutex<HashMap<String, VecDeque<Time>>>>,
-    clock: Option<Arc<dyn Clock>>,
+    hits: Arc<Mutex<HashMap<String, VecDeque<MonotonicInstant>>>>,
+    clock: Option<MonotonicClock>,
 }
 
 impl Observed for RateLimitView {
@@ -2028,15 +2034,15 @@ impl Observed for RateLimitView {
                 // window old, which `slide` drops from the front, so it is the same count
                 // `resolve` will see, found without walking the window. With no clock
                 // the window never slides, as `resolve` treats it.
-                let window = millis(rate.window);
+                let window = rate.window;
                 let empty = VecDeque::new();
                 let charged = hits.get(&prefix).unwrap_or(&empty);
-                let aged = now.map_or(0, |now| {
-                    charged.partition_point(|&t| elapsed(now, t) >= window)
+                let aged = now.as_ref().map_or(0, |now| {
+                    charged.partition_point(|t| elapsed(now, t) >= window)
                 });
-                if let (Some(now), Some(&oldest)) = (now, charged.get(aged)) {
+                if let (Some(now), Some(oldest)) = (&now, charged.get(aged)) {
                     let left = window.saturating_sub(elapsed(now, oldest));
-                    next_change = sooner(next_change, Duration::from_millis(left));
+                    next_change = sooner(next_change, left);
                 }
                 Key::Window {
                     prefix,
@@ -2061,7 +2067,7 @@ struct BreakerView {
     threshold: u32,
     cooldown: Duration,
     states: Arc<Mutex<HashMap<String, Breaker>>>,
-    clock: Option<Arc<dyn Clock>>,
+    clock: Option<MonotonicClock>,
 }
 
 impl Observed for BreakerView {
@@ -2074,14 +2080,13 @@ impl Observed for BreakerView {
         let keys = targets
             .into_iter()
             .map(|(target, breaker)| {
-                let circuit = match (breaker.opened_at, now) {
+                let circuit = match (&breaker.opened_at, &now) {
                     (None, _) => Circuit::Closed,
                     (Some(opened), Some(now)) => {
                         let cooled = elapsed(now, opened);
-                        let cooldown = millis(self.cooldown);
+                        let cooldown = self.cooldown;
                         if cooled < cooldown {
-                            next_change =
-                                sooner(next_change, Duration::from_millis(cooldown - cooled));
+                            next_change = sooner(next_change, cooldown - cooled);
                             Circuit::Open
                         } else {
                             Circuit::HalfOpen
@@ -2168,24 +2173,27 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use ikigai_core::{
-        Capability, EndpointSpace, Exact, FixedClock, FnEndpoint, Iri, Kernel, ReprType,
-        UriTemplate,
+        Capability, EndpointSpace, Exact, FnEndpoint, Iri, Kernel, ReprType, UriTemplate,
     };
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-    /// A clock that moves only when the test moves it. Core ships `FixedClock`, which
-    /// never moves, and says a crate that must advance time writes its own.
+    /// An elapsed counter that moves only when the test moves it, read through a
+    /// core `MonotonicClock` host adapter, as a wasm host would.
     #[derive(Clone, Default)]
     struct Manual(Arc<AtomicU64>);
     impl Manual {
         fn advance(&self, millis: u64) {
             self.0.fetch_add(millis, Ordering::SeqCst);
         }
-    }
-    impl Clock for Manual {
-        fn now(&self) -> Time {
-            Time::from_millis(self.0.load(Ordering::SeqCst))
+        fn mono(&self) -> MonotonicClock {
+            let ticks = Arc::clone(&self.0);
+            MonotonicClock::from_host(move || Duration::from_millis(ticks.load(Ordering::SeqCst)))
         }
+    }
+
+    /// A source that never moves.
+    fn stopped() -> MonotonicClock {
+        MonotonicClock::from_host(|| Duration::from_secs(1))
     }
 
     /// An endpoint whose failure is toggleable, counting invocations — so a test
@@ -2292,8 +2300,7 @@ mod tests {
         let space = EndpointSpace::new().bind_arc(Exact::new("urn:dep"), endpoint);
         let clock = Manual::default();
         let kernel = Kernel::new(Arc::new(
-            CircuitBreaker::new(space, 2, Duration::from_millis(20))
-                .with_clock(Arc::new(clock.clone())),
+            CircuitBreaker::new(space, 2, Duration::from_millis(20)).with_clock(clock.mono()),
         ));
         let src = || Request::new(Verb::Source, Iri::parse("urn:dep").unwrap());
 
@@ -2355,7 +2362,9 @@ mod tests {
 
     fn kernel_over(flaky: Arc<Flaky>, attempts: u32) -> Kernel {
         let inner = EndpointSpace::new().bind_arc(Exact::new("urn:flaky"), flaky);
-        Kernel::new(Arc::new(Retry::new(inner, attempts)))
+        Kernel::new(Arc::new(
+            Retry::new(inner, attempts).with_clock(MonotonicClock::native()),
+        ))
     }
 
     #[test]
@@ -2603,11 +2612,13 @@ mod tests {
 
     fn kernel_with(rate: Rate) -> Kernel {
         let inner = EndpointSpace::new().bind(Exact::new("urn:demo:tick"), always_ok());
-        let space = RateLimit::new(inner).limit("urn:demo:", rate);
+        let space = RateLimit::new(inner)
+            .limit("urn:demo:", rate)
+            .with_clock(MonotonicClock::native());
         Kernel::new(Arc::new(space))
     }
 
-    fn kernel_on(rate: Rate, clock: Arc<dyn Clock>) -> Kernel {
+    fn kernel_on(rate: Rate, clock: MonotonicClock) -> Kernel {
         let inner = EndpointSpace::new().bind(Exact::new("urn:demo:tick"), always_ok());
         let space = RateLimit::new(inner)
             .limit("urn:demo:", rate)
@@ -2668,10 +2679,7 @@ mod tests {
         // One per 10ms, on a clock the test moves: refused until the oldest hit is a
         // whole window old, and not a millisecond sooner.
         let clock = Manual::default();
-        let kernel = kernel_on(
-            Rate::new(1, Duration::from_millis(10)),
-            Arc::new(clock.clone()),
-        );
+        let kernel = kernel_on(Rate::new(1, Duration::from_millis(10)), clock.mono());
         assert!(tick(&kernel).is_ok());
         clock.advance(9);
         assert!(
@@ -2688,10 +2696,7 @@ mod tests {
     /// slides it, and panics on wasm32.
     #[test]
     fn a_rate_window_is_measured_on_the_governors_clock() {
-        let kernel = kernel_on(
-            Rate::new(1, Duration::from_millis(1)),
-            Arc::new(FixedClock::at(1_000)),
-        );
+        let kernel = kernel_on(Rate::new(1, Duration::from_millis(1)), stopped());
         assert!(tick(&kernel).is_ok());
         std::thread::sleep(Duration::from_millis(5));
         assert!(
@@ -2711,8 +2716,7 @@ mod tests {
         });
         let space = EndpointSpace::new().bind_arc(Exact::new("urn:dep"), endpoint);
         let kernel = Kernel::new(Arc::new(
-            CircuitBreaker::new(space, 1, Duration::from_millis(1))
-                .with_clock(Arc::new(FixedClock::at(1_000))),
+            CircuitBreaker::new(space, 1, Duration::from_millis(1)).with_clock(stopped()),
         ));
         let src = || Request::new(Verb::Source, Iri::parse("urn:dep").unwrap());
         assert!(block_on(kernel.issue(src(), &Capability::root())).is_err());
@@ -2732,7 +2736,7 @@ mod tests {
             .bind(Exact::new("urn:other:x"), always_ok());
         let mut space =
             RateLimit::new(inner).limit("urn:demo:", Rate::new(100, Duration::from_secs(1)));
-        space.clock = None; // what `new` leaves on wasm32
+        space.clock = None; // what `new` leaves on every target
         let kernel = Kernel::new(Arc::new(space));
         let err = tick(&kernel).unwrap_err();
         assert!(matches!(err, Error::Endpoint(_)), "{err:?}");
@@ -2758,7 +2762,7 @@ mod tests {
                     seen: seen.clone(),
                 }),
             );
-            let mut retry = Retry::new(inner, 3);
+            let mut retry = Retry::new(inner, 3).with_clock(stopped());
             if missing_clock {
                 retry.clock = None;
             } else {
@@ -2786,7 +2790,7 @@ mod tests {
         });
         let space = EndpointSpace::new().bind_arc(Exact::new("urn:dep"), endpoint);
         let mut breaker = CircuitBreaker::new(space, 2, Duration::from_secs(1));
-        breaker.clock = None; // what `new` leaves on wasm32
+        breaker.clock = None; // what `new` leaves on every target
         let kernel = Kernel::new(Arc::new(breaker));
         let err = block_on(kernel.issue(
             Request::new(Verb::Source, Iri::parse("urn:dep").unwrap()),

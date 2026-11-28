@@ -4,7 +4,9 @@ description = "Reliability interception overlays for ikigai: RateLimit (per-pref
 # 0.4.0: the public API now uses core 0.3 types (scoped content store, ledger #2965).
 # 0.6.2: Timeout honors an earlier run deadline (ledger #4006): both invocation faces schedule
 # the earlier of the overlay's budget and the run's deadline, and report that limit.
-version = "0.7.0"
+# 0.8.0: `with_clock` takes core's MonotonicClock and none is installed implicitly
+# (ledger #4302), a public API change.
+version = "0.8.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]
@@ -12,10 +14,10 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 
 [dependencies]
 # Wraps ANY Space. Builds for wasm32-unknown-unknown (CI's `wasm32 lib clippy`):
-# RateLimit and CircuitBreaker read time from a core Clock (`with_clock`; on wasm32
-# the host must install one, ledger #1507) and never from the platform; Timeout and
-# Retry wait on a Timer the host injects there (`with_timer`, ledger #2189). Clock and
-# Time are far older than the floor.
+# RateLimit, CircuitBreaker and Retry measure elapsed time on a core MonotonicClock
+# the host injects (`with_clock`, on every target; ledger #4302) and never on the
+# platform or on epoch time; Timeout and Retry wait on a Timer the host injects on
+# wasm32 (`with_timer`, ledger #2189).
 # 0.1.108 is the floor (ledger #1546, #200): Error::class + FailureClass (every
 # re-issuing overlay decides from the class it RECEIVED), Error::RetryAfter (what
 # RateLimit and an open CircuitBreaker answer), Verb::is_idempotent, and the run's
@@ -42,6 +44,10 @@ repository = "https://github.com/ikigai-rs/ikigai-throttle"
 # core 0.4.0: scope opacity, structured denials; the cascade.
 # 0.5.0 is the true floor for this cascade: Invocation::time_left measures
 # operational time, and public core types must match the host.
+# 0.5.0 also carries MonotonicClock / MonotonicInstant (core PR 355, ledger #1560):
+# 0.8.0 measures every window, cooldown and Retry's overall limit on one the host
+# injects (ledger #4302). Checked against the published 0.5.0 crate, whose
+# `src/monotonic.rs` is identical to 0.5.2's, so the floor does not move.
 ikigai-core = "0.5.0"
 # Retry's RetryEndpoint implements the async Endpoint trait directly.
 async-trait = "0.1"
