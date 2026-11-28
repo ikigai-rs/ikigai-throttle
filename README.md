@@ -70,8 +70,9 @@ run's remaining time. It races each async call against a timer and checks elapse
 time before starting another attempt. No attempt starts at the deadline. On the
 body face it ends when the endpoint hands over the body; use `Timeout` below it
 to bound subsequent streaming. A zero initial backoff disables backoff; an
-overall limit still applies. Use `with_clock` to install the kernel's clock and
-`with_timer` to install a timer advancing that same clock in tests. `with_jitter`
+overall limit still applies. Use `with_clock` to install an elapsed
+`MonotonicClock` (required: there is no default) and `with_timer` to install a timer
+advancing that same source in tests. `with_jitter`
 accepts a custom sampler; `FullJitter::seeded` gives a repeatable sequence for
 simulations. Jitter is for scheduling, not security.
 
@@ -89,7 +90,7 @@ run's retry pool or its overall time limit ran out, it returns core 0.3.5's
 - `attempts`: how many calls were made, the first one included
   (`Error::attempts()`);
 - `elapsed`: the time from the first attempt until it gave up, waits included,
-  on the clock installed with `with_clock` (`Error::elapsed_millis()`);
+  on the `MonotonicClock` installed with `with_clock` (`Error::elapsed_millis()`);
 - `detail`: the last attempt's error as it displayed, or, when the overall limit
   cut a call short before any error, a sentence naming the target and the limit.
 
@@ -136,7 +137,8 @@ resolved under. That is what lets an `Alias` be composed *below* a governor:
 ```rust
 // The `urn:store:` -> `urn:iki:store:` migration, rate-limited.
 let space = RateLimit::new(Alias::new(migration, backing))
-    .limit("urn:", Rate::new(100, Duration::from_secs(60)));
+    .limit("urn:", Rate::new(100, Duration::from_secs(60)))
+    .with_clock(clock.clone());
 ```
 
 The kernel adopts the reported name before it derives the cache id, fires the
@@ -200,11 +202,15 @@ use std::sync::Arc;
 
 // Bound each attempt, ride out blips on the primary, give up on it once it's a
 // corpse, and fail over to a backup — every layer reading the same failure class.
+// One elapsed source for every governor; no governor installs one itself.
+let clock = ikigai_core::MonotonicClock::native(); // wasm: MonotonicClock::from_host(..)
 let primary = CircuitBreaker::new(
-    Retry::new(Timeout::new(primary_space, Duration::from_secs(2)), 3),
+    Retry::new(Timeout::new(primary_space, Duration::from_secs(2)), 3)
+        .with_clock(clock.clone()),
     5,                          // trip after 5 consecutive transient failures
     Duration::from_secs(30),    // stay open 30s, then probe
-);
+)
+.with_clock(clock);
 let resilient = Failover::new(vec![Arc::new(primary), Arc::new(backup_space)]);
 // Kernel::new(Arc::new(resilient))
 ```
@@ -231,10 +237,11 @@ use ikigai_throttle::{CircuitBreaker, StateBoard};
 
 let board = StateBoard::new();
 let guarded = CircuitBreaker::new(inner, 5, Duration::from_secs(30))
+    .with_clock(clock)
     .observed(&board, "upstream")?;           // urn:throttle:state:upstream
 let root = Fallback::new(vec![Arc::new(board.space()), Arc::new(guarded)]);
 let kernel = Arc::new(Kernel::new(Arc::new(root)));
-board.attach(&kernel);                        // answers become cacheable
+board.attach(&kernel);                        // answers become cacheable (see below)
 ```
 
 | name | what it answers |
@@ -298,6 +305,7 @@ use ikigai_throttle::{RateLimit, Rate};
 use std::time::Duration;
 
 let space = RateLimit::new(inner)
+    .with_clock(ikigai_core::MonotonicClock::native())
     .limit("urn:system:exec", Rate::new(3, Duration::from_secs(10)))
     .limit("urn:httpGet",     Rate::new(30, Duration::from_secs(60)));
 // Kernel::new(Arc::new(space))
@@ -381,7 +389,10 @@ use ikigai_throttle::CircuitBreaker;
 let primary: Arc<dyn Space> = Arc::new(EndpointSpace::new()); // host bindings
 let secondary: Arc<dyn Space> = Arc::new(EndpointSpace::new());
 let governed = Fallback::new(vec![primary, secondary]);
-let shared = Arc::new(CircuitBreaker::new(governed, 3, Duration::from_secs(30)));
+let shared = Arc::new(
+    CircuitBreaker::new(governed, 3, Duration::from_secs(30))
+        .with_clock(ikigai_core::MonotonicClock::native()),
+);
 let root = Fallback::new(vec![
     Arc::new(Mount::new("urn:primary:", shared.clone())),
     Arc::new(Mount::new("urn:secondary:", shared.clone())),
@@ -389,13 +400,54 @@ let root = Fallback::new(vec![
 let kernel = Kernel::new(Arc::new(root));
 ```
 
-The prefixes filter requests; mounts do not rewrite targets. A host with an
-injected clock calls `with_clock` on the breaker before sharing it. The mock-clock
+The prefixes filter requests; mounts do not rewrite targets. The host calls
+`with_clock` on the breaker before sharing it. The mock-clock
 test in `tests/retry_policy.rs` opens a circuit through one host, observes it open
 through another, checks another mount's target is unaffected, and recovers after
 the cooldown.
 
-## Upgrade to 0.7.0
+## Upgrade from older versions
+
+### To 0.8.0
+
+Rate windows, circuit-breaker cooldowns and Retry's overall limit now measure
+ELAPSED time on core's `MonotonicClock` (ledger #4302, core's `docs/design/time.md`),
+so a wall-clock step (NTP, a laptop waking) can no longer expire a window early or
+hold a cooldown open past its end. This changes the public API:
+
+- `RateLimit::with_clock`, `CircuitBreaker::with_clock` and `Retry::with_clock` take
+  a `MonotonicClock` by value instead of an `Arc<dyn Clock>`.
+- **No clock is installed implicitly on any target.** On 0.7.0 a native build
+  defaulted to a private monotonic clock; now a governor without `with_clock`
+  refuses what it governs with the same permanent error naming its builder
+  (`install one with RateLimit::with_clock`), as wasm32 always did.
+
+What to change in a host:
+
+```rust
+// before (0.7.0)
+RateLimit::new(space).limit("urn:x:", rate).with_clock(Arc::new(SystemClock));
+// after (0.8.0), native
+RateLimit::new(space).limit("urn:x:", rate).with_clock(MonotonicClock::native());
+// after (0.8.0), wasm32: the host's own elapsed reader, e.g. `performance.now()`
+RateLimit::new(space).limit("urn:x:", rate)
+    .with_clock(MonotonicClock::from_host(move || elapsed_since_page_load()));
+```
+
+Share one `MonotonicClock` (it is cheap to clone, and clones share one source) among
+the governors of a host. A test that drove a governor with a hand-written `Clock`
+adapts its counter with `MonotonicClock::from_host`. The kernel's own clock
+(`Kernel::with_clock`) is unchanged and still bounds the run's deadline
+(`Invocation::time_left`).
+
+The state face no longer caches an answer while a timed change is pending (a hit
+still to age out, a cooldown still running): that deadline is elapsed time, and
+the kernel's cache deadline is an epoch `Time`, which a wall step would move. Such
+answers are now live; answers with nothing timed pending stay cacheable and are
+cut on every change, as before. The core pin stays `0.5.0`, the first release
+that carries `MonotonicClock`. Persisted state is unchanged; no migration is needed.
+
+### To 0.7.0
 
 This minor release uses ikigai-core 0.5.0 and ikigai-conformance 0.16.0.
 Public APIs carrying core types now use the core 0.5 types, so hosts must upgrade
@@ -408,17 +460,19 @@ Persisted state is unchanged; no migration is needed.
 
 ## Notes
 
-- **Time comes from a core `Clock`.** `RateLimit` (its window) and
-  `CircuitBreaker` (its cooldown), and `Retry` (its overall limit) read the clock given with `with_clock`, and
-  default to a monotonic clock on a native target. Hand them the clock you gave
-  your kernel, or a test clock that moves only when the test moves it. Time is
-  read in whole milliseconds. Never a temporal corridor's pinned clock: a window
-  measured on a stopped clock never slides.
+- **Intervals come from a core `MonotonicClock` the host injects.** `RateLimit`
+  (its window), `CircuitBreaker` (its cooldown) and `Retry` (its overall limit)
+  measure elapsed time on the clock given with `with_clock`, never epoch time, so
+  a wall-clock step moves no window's or cooldown's end. There is no default on
+  any target: pass `MonotonicClock::native()` on a native host, or
+  `MonotonicClock::from_host` over a reader a test advances. Never a temporal
+  corridor's pinned clock: a window measured on a stopped clock never slides.
 - **wasm32-unknown-unknown:** every overlay builds there (CI lints the lib on
   wasm32). A browser has a clock and timers, but this library cannot reach them
   without JavaScript imports, and the same target also runs where there is no
   JavaScript (wasmtime). So the HOST supplies them, as it does for its kernel: a
-  clock for `RateLimit`, `CircuitBreaker`, and `Retry` (`with_clock`), and a `Timer` for
+  `MonotonicClock::from_host` over its elapsed reader for `RateLimit`,
+  `CircuitBreaker`, and `Retry` (`with_clock`), and a `Timer` for
   `Timeout` and `Retry` (`with_timer`; a timer wakes a future, which a clock
   cannot). Without the required facilities, all four refuse what
   they govern with an error naming the builder, and never panic. A browser host's timer resolves a

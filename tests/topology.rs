@@ -22,6 +22,7 @@
 //!
 //! `Failover` encloses several spaces, not one, and stays opaque: see the last test.
 
+use ikigai_core::MonotonicClock;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,18 +82,24 @@ fn reports_what_it_encloses(name: &str, overlay: &dyn Space) {
 
 #[test]
 fn rate_limit_reports_what_it_encloses() {
-    let overlay = RateLimit::new(named()).limit("urn:demo:", Rate::new(1, Duration::from_secs(60)));
+    let overlay = RateLimit::new(named())
+        .with_clock(MonotonicClock::native())
+        .limit("urn:demo:", Rate::new(1, Duration::from_secs(60)));
     reports_what_it_encloses("RateLimit", &overlay);
 }
 
 #[test]
 fn retry_reports_what_it_encloses() {
-    reports_what_it_encloses("Retry", &Retry::new(named(), 3));
+    reports_what_it_encloses(
+        "Retry",
+        &Retry::new(named(), 3).with_clock(MonotonicClock::native()),
+    );
 }
 
 #[test]
 fn circuit_breaker_reports_what_it_encloses() {
-    let overlay = CircuitBreaker::new(named(), 3, Duration::from_secs(1));
+    let overlay = CircuitBreaker::new(named(), 3, Duration::from_secs(1))
+        .with_clock(MonotonicClock::native());
     reports_what_it_encloses("CircuitBreaker", &overlay);
 }
 
@@ -114,9 +121,11 @@ fn a_stack_of_governors_reports_the_innermost_space() {
             Timeout::new(named(), Duration::from_secs(1)),
             3,
             Duration::from_secs(1),
-        ),
+        )
+        .with_clock(MonotonicClock::native()),
         2,
-    );
+    )
+    .with_clock(MonotonicClock::native());
     reports_what_it_encloses("Retry(CircuitBreaker(Timeout))", &stack);
 }
 

@@ -41,7 +41,7 @@ impl Timer for Never {
 fn retry<S: Space>(space: S) -> Retry<S> {
     Retry::new(space, 3)
         .with_backoff(Duration::ZERO, Duration::ZERO)
-        .with_clock(Arc::new(FixedClock::at(0)))
+        .with_clock(mono(Arc::new(FixedClock::at(0))))
         .with_timer(Arc::new(Never))
 }
 fn failing(error: Error, calls: Arc<AtomicUsize>) -> EndpointSpace {
@@ -69,7 +69,7 @@ fn overlapping_rate_prefixes_have_independent_exact_sliding_windows() {
         // Short prefix is deliberately registered first.
         let limited = Arc::new(
             RateLimit::new(leaf)
-                .with_clock(clock.clone())
+                .with_clock(mono(clock.clone()))
                 .limit("urn:", Rate::new(1, ms(100)))
                 .limit("urn:dep:", Rate::new(2, ms(100))),
         );
@@ -119,7 +119,7 @@ fn caller_errors_are_neither_retried_nor_failed_over_nor_counted_by_the_breaker(
             let backup_calls = Arc::new(AtomicUsize::new(0));
             let primary =
                 CircuitBreaker::new(retry(failing(error.clone(), calls.clone())), 1, ms(100))
-                    .with_clock(Arc::new(FixedClock::at(0)));
+                    .with_clock(mono(Arc::new(FixedClock::at(0))));
             let failover = Failover::new(vec![
                 Arc::new(primary),
                 Arc::new(failing(
@@ -187,7 +187,7 @@ fn retry_inside_and_outside_a_breaker_count_at_their_own_boundary() {
             2,
             ms(100),
         )
-        .with_clock(Arc::new(FixedClock::at(0)));
+        .with_clock(mono(Arc::new(FixedClock::at(0))));
         let kernel = Kernel::new(Arc::new(inside));
         for expected_calls in [3, 6] {
             assert_eq!(
@@ -211,7 +211,7 @@ fn retry_inside_and_outside_a_breaker_count_at_their_own_boundary() {
                 2,
                 ms(100),
             )
-            .with_clock(Arc::new(FixedClock::at(0))),
+            .with_clock(mono(Arc::new(FixedClock::at(0)))),
         );
         let kernel = Kernel::new(Arc::new(outside));
         // Two underlying attempts trip; the third meets RetryAfter and cannot wait it.
@@ -272,4 +272,12 @@ fn timeout_inside_retry_cancels_every_attempt_before_reissuing() {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(dropped.load(Ordering::SeqCst), 3, "no attempt leaked");
     }
+}
+
+/// Read a test's counter clock through core's elapsed host adapter, as a wasm host
+/// reads its own elapsed source: governors take a `MonotonicClock`, never a wall `Clock`.
+fn mono<C: ikigai_core::Clock + 'static>(clock: std::sync::Arc<C>) -> ikigai_core::MonotonicClock {
+    ikigai_core::MonotonicClock::from_host(move || {
+        std::time::Duration::from_millis(clock.now().as_millis())
+    })
 }

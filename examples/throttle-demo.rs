@@ -1,6 +1,7 @@
 //! Watch a runaway loop hit the wall.
 //!
 //!   cargo run --example throttle-demo
+use ikigai_core::MonotonicClock;
 use ikigai_core::{
     Capability, EndpointSpace, Exact, FnEndpoint, Iri, Kernel, ReprType, Representation, Request,
     Verb,
@@ -19,8 +20,9 @@ fn main() {
         }),
     );
     // A budget a well-behaved caller stays under, and a runaway blows through.
-    let space =
-        RateLimit::new(inner).limit("urn:system:exec", Rate::new(3, Duration::from_secs(10)));
+    let space = RateLimit::new(inner)
+        .with_clock(MonotonicClock::native())
+        .limit("urn:system:exec", Rate::new(3, Duration::from_secs(10)));
     let kernel = Kernel::new(Arc::new(space));
 
     println!("budget: 3 exec calls / 10s\n");

@@ -79,7 +79,8 @@ impl Fixture {
             },
         );
         let kernel = Kernel::new(Arc::new(
-            CircuitBreaker::new(space, 1, Duration::from_millis(100)).with_clock(clock.clone()),
+            CircuitBreaker::new(space, 1, Duration::from_millis(100))
+                .with_clock(mono(clock.clone())),
         ));
         Self {
             kernel,
@@ -284,4 +285,12 @@ fn a_one_shot_probe_decides_health_when_its_stream_ends() {
             }
         }
     }
+}
+
+/// Read a test's counter clock through core's elapsed host adapter, as a wasm host
+/// reads its own elapsed source: governors take a `MonotonicClock`, never a wall `Clock`.
+fn mono<C: ikigai_core::Clock + 'static>(clock: std::sync::Arc<C>) -> ikigai_core::MonotonicClock {
+    ikigai_core::MonotonicClock::from_host(move || {
+        std::time::Duration::from_millis(clock.now().as_millis())
+    })
 }

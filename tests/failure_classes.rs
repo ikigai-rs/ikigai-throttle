@@ -9,6 +9,7 @@
 //! Time is a clock the test moves, and the timer a `Retry` waits on moves that same clock,
 //! so every wait is exact and costs no real time.
 
+use ikigai_core::MonotonicClock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,7 +26,7 @@ use ikigai_throttle::{CircuitBreaker, Failover, Rate, RateLimit, Retry, Timer};
 fn retry<S: Space>(inner: S, attempts: u32) -> Retry<S> {
     Retry::new(inner, attempts)
         .with_backoff(Duration::ZERO, Duration::ZERO)
-        .with_clock(Arc::new(Manual::default()))
+        .with_clock(mono(Arc::new(Manual::default())))
 }
 
 /// A clock that moves only when the test (or the timer) moves it.
@@ -181,7 +182,7 @@ fn retry_decides_from_each_class() {
         let timer = Advancing::on(&clock);
         let (space, seen) = failing(&error);
         let retry = retry(space, 3)
-            .with_clock(Arc::new(clock.clone()))
+            .with_clock(mono(Arc::new(clock.clone())))
             .with_timer(Arc::new(timer.clone()))
             .with_max_wait(Duration::from_secs(60));
         let kernel = Kernel::new(Arc::new(retry)).with_clock(Arc::new(clock.clone()));
@@ -264,7 +265,7 @@ fn a_breaker_counts_only_transient_failures() {
         let (space, seen) = failing(&error);
         let kernel = Kernel::new(Arc::new(
             CircuitBreaker::new(space, 1, Duration::from_millis(1_000))
-                .with_clock(Arc::new(clock.clone())),
+                .with_clock(mono(Arc::new(clock.clone()))),
         ));
         assert_eq!(read(&kernel).unwrap_err(), error, "{class}");
         clock.advance(Duration::from_millis(250));
@@ -393,7 +394,7 @@ fn a_retry_after_longer_than_the_time_left_is_not_waited() {
         let (space, seen) = failing(&error);
         let kernel = Kernel::new(Arc::new(
             retry(space)
-                .with_clock(Arc::new(clock.clone()))
+                .with_clock(mono(Arc::new(clock.clone())))
                 .with_timer(Arc::new(timer.clone())),
         ))
         .with_clock(Arc::new(clock.clone()));
@@ -462,7 +463,7 @@ fn without_a_deadline_the_own_bound_decides() {
         let clock = Manual::at(0);
         let (space, seen) = failing(&limited(delay));
         let mut retry = retry(space, 2)
-            .with_clock(Arc::new(clock.clone()))
+            .with_clock(mono(Arc::new(clock.clone())))
             .with_timer(Arc::new(Advancing::on(&clock)));
         if let Some(bound) = bound {
             retry = retry.with_max_wait(bound);
@@ -515,7 +516,8 @@ fn an_over_budget_failure_is_never_reissued() {
     // The README's stack, under a breaker that would trip on one transient failure.
     let (space, seen) = failing(&over);
     let stack = retry(
-        CircuitBreaker::new(retry(space, 10), 1, Duration::from_secs(30)),
+        CircuitBreaker::new(retry(space, 10), 1, Duration::from_secs(30))
+            .with_clock(MonotonicClock::native()),
         10,
     );
     let kernel = generous(Kernel::new(Arc::new(stack)));
@@ -538,7 +540,7 @@ fn a_rate_limit_answers_the_time_to_its_next_opening() {
     let kernel = Kernel::new(Arc::new(
         RateLimit::new(space)
             .limit("urn:", Rate::new(2, Duration::from_millis(100)))
-            .with_clock(Arc::new(clock.clone())),
+            .with_clock(mono(Arc::new(clock.clone()))),
     ));
     assert!(read(&kernel).is_ok());
     clock.advance(Duration::from_millis(30));
@@ -562,9 +564,9 @@ fn a_retry_waits_out_a_rate_limit_and_gets_through() {
     let (space, seen) = failing_for(&Error::Unavailable("unused".into()), 0);
     let limited = RateLimit::new(space)
         .limit("urn:", Rate::new(1, Duration::from_millis(100)))
-        .with_clock(Arc::new(clock.clone()));
+        .with_clock(mono(Arc::new(clock.clone())));
     let retry = retry(limited, 2)
-        .with_clock(Arc::new(clock.clone()))
+        .with_clock(mono(Arc::new(clock.clone())))
         .with_timer(Arc::new(timer.clone()))
         .with_max_wait(Duration::from_secs(1));
     let kernel = Kernel::new(Arc::new(retry)).with_clock(Arc::new(clock.clone()));
@@ -587,13 +589,21 @@ fn a_retry_waits_out_an_open_circuit() {
     let timer = Advancing::on(&clock);
     let (space, seen) = failing_for(&Error::Unavailable("blip".into()), 1);
     let breaker = CircuitBreaker::new(space, 1, Duration::from_millis(100))
-        .with_clock(Arc::new(clock.clone()));
+        .with_clock(mono(Arc::new(clock.clone())));
     let retry = retry(breaker, 3)
-        .with_clock(Arc::new(clock.clone()))
+        .with_clock(mono(Arc::new(clock.clone())))
         .with_timer(Arc::new(timer.clone()))
         .with_max_wait(Duration::from_secs(1));
     let kernel = Kernel::new(Arc::new(retry)).with_clock(Arc::new(clock));
     assert!(read(&kernel).is_ok(), "blip, open circuit, wait, probe");
     assert_eq!(timer.waits(), [Duration::from_millis(100)]);
     assert_eq!(seen.load(Ordering::SeqCst), 2, "the blip and the probe");
+}
+
+/// Read a test's counter clock through core's elapsed host adapter, as a wasm host
+/// reads its own elapsed source: governors take a `MonotonicClock`, never a wall `Clock`.
+fn mono<C: ikigai_core::Clock + 'static>(clock: std::sync::Arc<C>) -> ikigai_core::MonotonicClock {
+    ikigai_core::MonotonicClock::from_host(move || {
+        std::time::Duration::from_millis(clock.now().as_millis())
+    })
 }

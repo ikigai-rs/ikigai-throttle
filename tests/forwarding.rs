@@ -1,4 +1,5 @@
 //! Forwarding metadata must survive every reliability overlay (ledger #2537).
+use ikigai_core::MonotonicClock;
 use std::{sync::Arc, time::Duration};
 
 use futures::{executor::block_on, StreamExt};
@@ -62,13 +63,18 @@ fn overlays() -> Vec<(&'static str, Arc<dyn Space>)> {
             Arc::new(
                 RateLimit::new(fixture())
                     .limit("urn:", Rate::new(100, Duration::from_secs(1)))
-                    .with_clock(clock()),
+                    .with_clock(mono(clock())),
             ),
         ),
-        ("Retry", Arc::new(Retry::new(fixture(), 3))),
+        (
+            "Retry",
+            Arc::new(Retry::new(fixture(), 3).with_clock(MonotonicClock::native())),
+        ),
         (
             "CircuitBreaker",
-            Arc::new(CircuitBreaker::new(fixture(), 3, Duration::from_secs(1)).with_clock(clock())),
+            Arc::new(
+                CircuitBreaker::new(fixture(), 3, Duration::from_secs(1)).with_clock(mono(clock())),
+            ),
         ),
         (
             "Failover",
@@ -88,17 +94,20 @@ fn overlays() -> Vec<(&'static str, Arc<dyn Space>)> {
         (
             "stack",
             Arc::new(Timeout::new(
-                Throttle::new(Retry::new(
-                    CircuitBreaker::new(
-                        RateLimit::new(Failover::new(vec![Arc::new(fixture())]))
-                            .limit("urn:", Rate::new(100, Duration::from_secs(1)))
-                            .with_clock(clock()),
+                Throttle::new(
+                    Retry::new(
+                        CircuitBreaker::new(
+                            RateLimit::new(Failover::new(vec![Arc::new(fixture())]))
+                                .limit("urn:", Rate::new(100, Duration::from_secs(1)))
+                                .with_clock(mono(clock())),
+                            3,
+                            Duration::from_secs(1),
+                        )
+                        .with_clock(mono(clock())),
                         3,
-                        Duration::from_secs(1),
                     )
-                    .with_clock(clock()),
-                    3,
-                ))
+                    .with_clock(MonotonicClock::native()),
+                )
                 .limit("urn:", 2),
                 Duration::from_secs(30),
             )),
@@ -169,7 +178,7 @@ fn an_over_budget_rate_limit_preserves_forwarding_metadata() {
     let limited = Arc::new(
         RateLimit::new(fixture())
             .limit("urn:", Rate::new(0, Duration::from_secs(1)))
-            .with_clock(Arc::new(FixedClock::at(1_000))),
+            .with_clock(mono(Arc::new(FixedClock::at(1_000)))),
     );
     for target in [VIEW, NAMED] {
         let request = Request::new(Verb::Source, Iri::parse(target).unwrap());
@@ -185,4 +194,12 @@ fn an_over_budget_rate_limit_preserves_forwarding_metadata() {
         let error = block_on(kernel.issue(request, &Capability::root())).unwrap_err();
         assert!(matches!(error, ikigai_core::Error::RetryAfter { .. }));
     }
+}
+
+/// Read a test's counter clock through core's elapsed host adapter, as a wasm host
+/// reads its own elapsed source: governors take a `MonotonicClock`, never a wall `Clock`.
+fn mono<C: ikigai_core::Clock + 'static>(clock: std::sync::Arc<C>) -> ikigai_core::MonotonicClock {
+    ikigai_core::MonotonicClock::from_host(move || {
+        std::time::Duration::from_millis(clock.now().as_millis())
+    })
 }
