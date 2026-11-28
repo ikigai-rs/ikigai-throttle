@@ -30,7 +30,10 @@ This is a library of overlays a host stacks around its spaces.
   timer, naming `Retry::with_clock` and `Retry::with_timer`. When Retry gives up it
   answers core's `GaveUp`, whose display core writes (`gave up after 3 attempts over
   30 ms: unavailable: upstream down`, singular for one attempt) and which carries the
-  last error's message; when the overall limit cut a call short before any error, that
+  last error's message. When that last error is the breaker's own circuit-open refusal,
+  the message first names the last other failure, its sentence and its class in words
+  (``unavailable: connection refused (transient failure), then retry after 25296 ms:
+  circuit open for `urn:x` ``), so the cause comes before the refusal; when the overall limit cut a call short before any error, that
   message names the target (`` retry: `urn:x` exceeded its overall time limit ``).
 - **Refusals from the state face**: an unknown face (`as=`), a governor name that is not
   allowed, or one already observed, each an `InvalidArgument` naming the argument with a

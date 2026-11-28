@@ -617,7 +617,8 @@ impl Endpoint for RateLimited {
 /// would repeat, because its attempts, the run's pool or its overall limit ran out, it
 /// returns [`Error::GaveUp`] with `attempts` (calls made, the first included), `elapsed`
 /// (on the installed clock, from the first attempt, waits included) and `detail` (the
-/// last error as it displayed). `GaveUp` means "retried and stopped": a failure Retry
+/// last error as it displayed; behind a [`CircuitBreaker`]'s "circuit open", the last
+/// other failure's sentence and class come first, ledger #4505). `GaveUp` means "retried and stopped": a failure Retry
 /// does not repeat (a refusal, a denial, a Sink with no declared resend safety, a
 /// retry-after delay that does not fit) comes back unchanged, and so does a repeatable
 /// one stopped by its attempts or the pool before any re-issue (`attempts` of 1, or an
@@ -772,6 +773,9 @@ impl<S: Space> Space for Retry<S> {
     }
 }
 
+/// The start of an open circuit's refusal detail, which Retry recognizes (ledger #4505).
+const CIRCUIT_OPEN: &str = "circuit open for ";
+
 /// When a failure may be repeated, by the class core gives it.
 enum Repeat {
     /// Re-issue with backoff (transient).
@@ -922,8 +926,11 @@ impl RetryEndpoint {
         // add their attempts instead of multiplying them.
         let mut issued: u32 = 0;
         let mut last: Option<Error> = None;
-        let gave_up = |issued: u32, last: Option<&Error>| match last {
-            Some(error) => give_up(issued, elapsed(), error),
+        // The last failure that was not a breaker's own "circuit open" (ledger #4505), so
+        // a give-up behind an open circuit still names what failed.
+        let mut cause: Option<Error> = None;
+        let gave_up = |issued: u32, last: Option<&Error>, cause: Option<&Error>| match last {
+            Some(error) => give_up(issued, elapsed(), error, cause),
             None => Error::GaveUp {
                 attempts: issued,
                 elapsed: elapsed(),
@@ -944,7 +951,7 @@ impl RetryEndpoint {
                         inv.request.target
                     )));
                 }
-                return Err(gave_up(issued, last.as_ref()));
+                return Err(gave_up(issued, last.as_ref(), cause.as_ref()));
             }
             let work = F::call(&*self.inner, inv);
             let deadline = timer.sleep(left);
@@ -958,10 +965,13 @@ impl RetryEndpoint {
                 futures::future::Either::Left((Err(error), _)) => error,
                 futures::future::Either::Right(_) => {
                     issued = issued.saturating_add(1);
-                    return Err(gave_up(issued, last.as_ref()));
+                    return Err(gave_up(issued, last.as_ref(), cause.as_ref()));
                 }
             };
             issued = issued.saturating_add(error.attempts().unwrap_or(1));
+            if !is_circuit_open(&error) {
+                cause = Some(error.clone());
+            }
             // A failure this overlay would not repeat comes back as it was received,
             // never wrapped: `GaveUp` means "retried and stopped".
             let minimum = match repeat(&error) {
@@ -976,13 +986,13 @@ impl RetryEndpoint {
             // (here or in an inner layer), or when the overall limit is what stopped it.
             let stop = |error: Error| {
                 if issued > 1 {
-                    give_up(issued, elapsed(), &error)
+                    give_up(issued, elapsed(), &error, cause.as_ref())
                 } else {
                     error
                 }
             };
             if remaining().is_zero() {
-                return Err(give_up(issued, elapsed(), &error));
+                return Err(give_up(issued, elapsed(), &error, cause.as_ref()));
             }
             if issued >= self.attempts {
                 return Err(stop(error));
@@ -996,7 +1006,7 @@ impl RetryEndpoint {
             let left = remaining();
             if delay >= left {
                 timer.sleep(left).await;
-                return Err(give_up(issued, elapsed(), &error));
+                return Err(give_up(issued, elapsed(), &error, cause.as_ref()));
             }
             if !cap.is_zero() || !delay.is_zero() {
                 timer.sleep(delay).await;
@@ -1009,15 +1019,39 @@ impl RetryEndpoint {
 /// The typed final failure (ledger #3385): `issued` calls over `elapsed`, carrying the
 /// last error's message. An inner layer's `GaveUp` lends its own detail, so nesting
 /// never stacks "gave up after …" prefixes.
-fn give_up(issued: u32, elapsed: Duration, last: &Error) -> Error {
-    let detail = match last {
-        Error::GaveUp { detail, .. } => detail.clone(),
-        other => other.to_string(),
+///
+/// When the last error is a breaker's own "circuit open" and an earlier attempt failed
+/// otherwise (`cause`, ledger #4505), the detail names that failure first, its sentence
+/// and its class, then the refusal: ``unavailable: connection refused (transient
+/// failure), then retry after 25296 ms: circuit open for `urn:x` ``. A caller can then
+/// tell a dependency that ran past its budget from one that refused to connect.
+fn give_up(issued: u32, elapsed: Duration, last: &Error, cause: Option<&Error>) -> Error {
+    let detail = match (last, cause) {
+        (open, Some(cause)) if is_circuit_open(open) => {
+            format!("{}, then {open}", failure_sentence(cause))
+        }
+        (Error::GaveUp { detail, .. }, _) => detail.clone(),
+        (other, _) => other.to_string(),
     };
     Error::GaveUp {
         attempts: issued,
         elapsed,
         detail,
+    }
+}
+
+/// Whether `error` is a [`CircuitBreaker`]'s own refusal of an open circuit: a
+/// retry-after whose detail is the breaker's `circuit open for …` sentence.
+fn is_circuit_open(error: &Error) -> bool {
+    matches!(error, Error::RetryAfter { detail, .. } if detail.starts_with(CIRCUIT_OPEN))
+}
+
+/// How a give-up names an earlier failure: its sentence, then its class in words. An
+/// inner Retry's `GaveUp` lends its own detail, which already names what it saw.
+fn failure_sentence(error: &Error) -> String {
+    match error {
+        Error::GaveUp { detail, .. } => detail.clone(),
+        other => format!("{other} ({} failure)", other.class().word()),
     }
 }
 
@@ -1301,7 +1335,7 @@ impl BreakerEndpoint {
                         // An in-flight probe has no known completion time.
                         delay: (!breaker.probing)
                             .then(|| self.cooldown.saturating_sub(Duration::from_millis(cooled))),
-                        detail: format!("circuit open for `{}`", self.tally.target),
+                        detail: format!("{CIRCUIT_OPEN}`{}`", self.tally.target),
                     });
                 }
                 // Reserve under the same lock as the gate check.
