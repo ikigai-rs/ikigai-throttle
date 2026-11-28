@@ -92,6 +92,11 @@ run's retry pool or its overall time limit ran out, it returns core 0.3.5's
   on the clock installed with `with_clock` (`Error::elapsed_millis()`);
 - `detail`: the last attempt's error as it displayed, or, when the overall limit
   cut a call short before any error, a sentence naming the target and the limit.
+  When that last error is a `CircuitBreaker`'s own "circuit open" refusal and an
+  earlier attempt failed otherwise, `detail` names the last such failure first, its
+  sentence and its class, then the refusal (ledger #4505):
+  ``unavailable: connection refused (transient failure), then retry after 25296 ms:
+  circuit open for `urn:x` ``.
 
 It displays as `gave up after 3 attempts over 300 ms: unavailable: upstream down`,
 its kind is `gave-up`, and its class is transient: a caller may try again later, and
@@ -394,6 +399,25 @@ injected clock calls `with_clock` on the breaker before sharing it. The mock-clo
 test in `tests/retry_policy.rs` opens a circuit through one host, observes it open
 through another, checks another mount's target is unaffected, and recovers after
 the cooldown.
+
+## Upgrade to 0.7.1
+
+A patch release; no API changes. When `Retry` gives up behind an open circuit, the
+`GaveUp` message changes (ledger #4505, split from #4504). It used to show only the
+breaker's refusal:
+
+    gave up after 10 attempts over 120002 ms: retry after 25296 ms: circuit open for `urn:x`
+
+It now names the last failure that was not the breaker's "circuit open", its
+sentence and its class, before that refusal:
+
+    gave up after 10 attempts over 120002 ms: unavailable: connection refused (transient failure), then retry after 25296 ms: circuit open for `urn:x`
+
+The error's variant (`Error::GaveUp`), kind (`gave-up`), class (transient),
+`attempts` and `elapsed` are unchanged; only `detail`, and so the display, changes.
+A host that matched the old text exactly, or that read `detail` as one error's
+display, should match on the variant, `Error::attempts()` and the class instead.
+When every attempt met the open circuit, the message is as before.
 
 ## Upgrade to 0.7.0
 

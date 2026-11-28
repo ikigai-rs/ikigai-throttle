@@ -4,7 +4,8 @@ description = "Reliability interception overlays for ikigai: RateLimit (per-pref
 # 0.4.0: the public API now uses core 0.3 types (scoped content store, ledger #2965).
 # 0.6.2: Timeout honors an earlier run deadline (ledger #4006): both invocation faces schedule
 # the earlier of the overlay's budget and the run's deadline, and report that limit.
-version = "0.7.0"
+# 0.7.1: a give-up behind an open circuit names the failure beneath it (ledger #4505).
+version = "0.7.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Brian Sletten <brian.sletten@gmail.com>"]

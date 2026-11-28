@@ -693,3 +693,101 @@ fn a_failed_breaker_probe_restarts_the_cooldown_before_recovery() {
         assert_eq!(f.calls(), 4);
     }
 }
+
+// Ledger #4505 (split from #4504): when the breaker beneath Retry opens, the give-up names
+// the last failure that was not the breaker's own "circuit open", its class and its
+// sentence, so a caller can tell what actually failed.
+
+/// Retry over a breaker that trips after 2 transient failures and cools for `cooldown`.
+fn retry_over_breaker(f: &Fixture, error: Error, attempts: u32, cooldown: Duration) -> Kernel {
+    let breaker = CircuitBreaker::new(f.space(u32::MAX, Duration::ZERO, false, error), 2, cooldown)
+        .with_clock(f.clock.clone());
+    let retry = Retry::new(breaker, attempts)
+        .with_clock(f.clock.clone())
+        .with_timer(f.timer.clone())
+        .with_backoff(ms(10), ms(10))
+        .with_jitter(Arc::new(Upper::default()))
+        .with_max_wait(Duration::from_secs(60));
+    Kernel::new(Arc::new(retry)).with_clock(f.clock.clone())
+}
+
+#[test]
+fn a_give_up_behind_an_open_circuit_names_the_failure_that_opened_it() {
+    for body in [false, true] {
+        let f = Fixture::new();
+        // Two transient failures trip the breaker; the third call is its refusal.
+        let kernel = retry_over_breaker(&f, down(), 3, ms(50));
+        let err = read(&kernel, body).unwrap_err();
+        assert_eq!(f.calls(), 2, "the open circuit spared the dependency");
+        assert_eq!(
+            err.to_string(),
+            "gave up after 3 attempts over 20 ms: unavailable: upstream down (transient \
+             failure), then retry after 40 ms: circuit open for `urn:dep`"
+        );
+        // The type and class are unchanged.
+        assert!(matches!(err, Error::GaveUp { attempts: 3, .. }), "{err:?}");
+        assert_eq!(err.class(), ikigai_core::FailureClass::Transient);
+    }
+}
+
+#[test]
+fn a_give_up_tells_a_timeout_from_a_refused_connection_behind_an_open_circuit() {
+    let budget = Error::Timeout("`urn:dep` exceeded 500ms".into());
+    let refused = Error::Unavailable("connection refused".into());
+    for (error, named) in [
+        (
+            budget,
+            "timeout: `urn:dep` exceeded 500ms (transient failure)",
+        ),
+        (
+            refused,
+            "unavailable: connection refused (transient failure)",
+        ),
+    ] {
+        let f = Fixture::new();
+        // The overall limit runs out while waiting out the cooldown, as in #4504.
+        let breaker =
+            CircuitBreaker::new(f.space(u32::MAX, Duration::ZERO, false, error), 2, ms(500))
+                .with_clock(f.clock.clone());
+        let retry = Retry::new(breaker, 10)
+            .with_clock(f.clock.clone())
+            .with_timer(f.timer.clone())
+            .with_backoff(ms(10), ms(10))
+            .with_jitter(Arc::new(Upper::default()))
+            .with_max_wait(Duration::from_secs(60))
+            .with_time_limit(ms(100));
+        let kernel = Kernel::new(Arc::new(retry)).with_clock(f.clock.clone());
+        let err = read(&kernel, false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "gave up after 3 attempts over 100 ms: {named}, then retry after 490 ms: \
+                 circuit open for `urn:dep`"
+            )
+        );
+    }
+}
+
+#[test]
+fn a_circuit_open_from_the_first_call_has_nothing_else_to_name() {
+    let f = Fixture::new();
+    let breaker = CircuitBreaker::new(f.space(u32::MAX, Duration::ZERO, false, down()), 2, ms(500))
+        .with_clock(f.clock.clone());
+    let retry = Retry::new(breaker, 10)
+        .with_clock(f.clock.clone())
+        .with_timer(f.timer.clone())
+        .with_backoff(ms(10), ms(10))
+        .with_jitter(Arc::new(Upper::default()))
+        .with_max_wait(Duration::from_secs(60))
+        .with_time_limit(ms(100));
+    let kernel = Kernel::new(Arc::new(retry)).with_clock(f.clock.clone());
+    // The first run trips the circuit; the second meets only the open circuit, whose
+    // cooldown outlasts the overall limit.
+    let _ = read(&kernel, false);
+    let err = read(&kernel, false).unwrap_err();
+    assert_eq!(f.calls(), 2);
+    assert_eq!(
+        err.to_string(),
+        "gave up after 1 attempt over 100 ms: retry after 410 ms: circuit open for `urn:dep`"
+    );
+}
